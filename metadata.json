@@ -1,0 +1,6 @@
+{
+  "name": "Vinicunca",
+  "description": "Vinicunca — Sentient conversational AI avatar in continuous lifelike motion.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

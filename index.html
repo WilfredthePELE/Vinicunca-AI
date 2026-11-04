@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vinicunca</title>
+    <meta name="description" content="Vinicunca — Living sculpture in motion." />
+    <meta property="og:title" content="Vinicunca" />
+    <meta property="og:description" content="Vinicunca — Living sculpture in motion." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script>
+      (function() {
+        // Intercept and silence Vite HMR WebSocket reconnection logs in AI Studio preview
+        var isWsMsg = function(msg) {
+          if (!msg) return false;
+          var s = typeof msg === 'string' ? msg : (msg.message || msg.stack || String(msg));
+          return s.indexOf('WebSocket') !== -1 || s.indexOf('websocket') !== -1 || s.indexOf('[vite]') !== -1;
+        };
+
+        var origError = console.error;
+        console.error = function() {
+          for (var i = 0; i < arguments.length; i++) {
+            if (isWsMsg(arguments[i])) return;
+          }
+          return origError.apply(console, arguments);
+        };
+
+        var origWarn = console.warn;
+        console.warn = function() {
+          for (var i = 0; i < arguments.length; i++) {
+            if (isWsMsg(arguments[i])) return;
+          }
+          return origWarn.apply(console, arguments);
+        };
+
+        window.addEventListener('unhandledrejection', function(event) {
+          if (event && isWsMsg(event.reason)) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+          }
+        }, true);
+
+        window.addEventListener('error', function(event) {
+          if (event && (isWsMsg(event.message) || isWsMsg(event.error))) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+          }
+        }, true);
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
