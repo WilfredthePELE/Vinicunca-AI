@@ -1,243 +1,399 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
-import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
 import path from 'path';
 import fs from 'fs';
+import { Readable } from 'stream';
 
 dotenv.config();
 
-// Enforce HMR disabled in AI Studio container environment
-process.env.DISABLE_HMR = 'true';
+// Enforce HMR disabled in the AI Studio container environment.
+process.env.DISABLE_HMR = process.env.DISABLE_HMR || 'true';
 
 const app = express();
-const PORT = 3000;
-
+const PORT = Number(process.env.PORT || 3000);
 app.use(express.json({ limit: '10mb' }));
 
-const CSV_PATH = path.resolve(process.cwd(), 'src', 'data', 'invitations.csv');
+const DATA_PATH = path.resolve(process.env.DATA_DIR || path.join(process.cwd(), 'data'));
+const CSV_PATH = path.join(DATA_PATH, 'invitations.csv');
+const SEED_CSV_PATH = path.resolve(process.cwd(), 'src', 'data', 'invitations.csv');
+const CHECKINS_PATH = path.join(DATA_PATH, 'check-ins.json');
 
-// Parse CSV string into array of objects
-function parseCSV(csvString: string) {
-  const lines = csvString.trim().split(/\r?\n/);
-  if (lines.length <= 1) return [];
-
-  const headers = lines[0].split(',').map((h) => h.trim().toLowerCase());
-  const nameIndex = headers.indexOf('name') !== -1 ? headers.indexOf('name') : 0;
-  const tierIndex = headers.indexOf('tier') !== -1 ? headers.indexOf('tier') : 1;
-  const tableIndex = headers.indexOf('table') !== -1 ? headers.indexOf('table') : 2;
-
-  const records = [];
-  for (let i = 1; i < lines.length; i++) {
-    const row = lines[i];
-    if (!row.trim()) continue;
-
-    // Handle quoted values
-    const values = [];
-    let insideQuotes = false;
-    let currentVal = '';
-    for (let char of row) {
-      if (char === '"') {
-        insideQuotes = !insideQuotes;
-      } else if (char === ',' && !insideQuotes) {
-        values.push(currentVal.trim());
-        currentVal = '';
-      } else {
-        currentVal += char;
-      }
-    }
-    values.push(currentVal.trim());
-
-    records.push({
-      name: values[nameIndex] || 'Guest',
-      tier: values[tierIndex] || 'Invited Attendee',
-      table: values[tableIndex] || 'Sanctuary 01',
-    });
-  }
-
-  return records;
+interface Guest {
+  id: string;
+  name: string;
+  tier: string;
+  table: string;
 }
 
-// In-memory guest list cache
-let guestList: Array<{ name: string; tier: string; table: string }> = [];
+interface CheckIn {
+  attendeeId: string;
+  name: string;
+  checkedInAt: string;
+}
+
+function parseCSV(csvString: string): Guest[] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = '';
+  let quoted = false;
+  const text = csvString.replace(/^\uFEFF/, '');
+
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    if (char === '"') {
+      if (quoted && text[i + 1] === '"') {
+        field += '"';
+        i += 1;
+      } else {
+        quoted = !quoted;
+      }
+    } else if (char === ',' && !quoted) {
+      row.push(field.trim());
+      field = '';
+    } else if ((char === '\n' || char === '\r') && !quoted) {
+      if (char === '\r' && text[i + 1] === '\n') i += 1;
+      row.push(field.trim());
+      if (row.some((value) => value.length > 0)) rows.push(row);
+      row = [];
+      field = '';
+    } else {
+      field += char;
+    }
+  }
+  row.push(field.trim());
+  if (row.some((value) => value.length > 0)) rows.push(row);
+  if (rows.length <= 1) return [];
+
+  const headers = rows[0].map((value) => value.toLowerCase());
+  const nameIndex = headers.indexOf('name') >= 0 ? headers.indexOf('name') : 0;
+  const tierIndex = headers.indexOf('tier');
+  const tableIndex = headers.indexOf('table');
+
+  const occurrences = new Map<string, number>();
+  return rows.slice(1).flatMap((values) => {
+    const name = values[nameIndex]?.trim();
+    if (!name) return [];
+    const slug = name
+      .normalize('NFKD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-');
+    const occurrence = (occurrences.get(slug) || 0) + 1;
+    occurrences.set(slug, occurrence);
+    return [{
+      id: `guest-${slug}-${occurrence}`,
+      name,
+      tier: (tierIndex >= 0 ? values[tierIndex] : '')?.trim() || 'Invited Guest',
+      table: (tableIndex >= 0 ? values[tableIndex] : '')?.trim() || 'Main Pavilion',
+    }];
+  });
+}
+
+function loadGuests(): Guest[] {
+  try {
+    const sourcePath = fs.existsSync(CSV_PATH) ? CSV_PATH : SEED_CSV_PATH;
+    return fs.existsSync(sourcePath) ? parseCSV(fs.readFileSync(sourcePath, 'utf8')) : [];
+  } catch (error) {
+    console.error('Unable to read attendee list:', error);
+    return [];
+  }
+}
+
+let guestList = loadGuests();
+const checkIns = new Map<string, CheckIn>();
+const SUPABASE_URL = process.env.SUPABASE_URL?.replace(/\/$/, '');
+// Prefer Supabase's newer server-only secret key, while retaining compatibility
+// with projects that still use the legacy service_role key.
+const SUPABASE_SERVER_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
+const hasSupabase = Boolean(SUPABASE_URL && SUPABASE_SERVER_KEY);
+
+async function supabaseRequest(resource: string, init: RequestInit = {}) {
+  if (!SUPABASE_URL || !SUPABASE_SERVER_KEY) throw new Error('Supabase is not configured');
+  return fetch(`${SUPABASE_URL}/rest/v1/${resource}`, {
+    ...init,
+    headers: {
+      apikey: SUPABASE_SERVER_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVER_KEY}`,
+      'Content-Type': 'application/json',
+      ...(init.headers || {}),
+    },
+  });
+}
+
+async function saveGuestsToSupabase(guests: Guest[]) {
+  const response = await supabaseRequest('event_attendees?on_conflict=id', {
+    method: 'POST',
+    headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+    body: JSON.stringify(guests.map((guest) => ({
+      id: guest.id,
+      name: guest.name,
+      tier: guest.tier,
+      table_name: guest.table,
+    }))),
+  });
+  if (!response.ok) throw new Error(`Supabase attendee save failed (${response.status})`);
+}
+
+async function loadSupabaseData() {
+  if (!hasSupabase) return;
+  checkIns.clear();
+  const attendeesResponse = await supabaseRequest('event_attendees?select=id,name,tier,table_name&order=name.asc');
+  if (!attendeesResponse.ok) throw new Error(`Supabase attendee load failed (${attendeesResponse.status})`);
+  const attendees = await attendeesResponse.json() as Array<{ id: string; name: string; tier: string; table_name: string }>;
+  if (attendees.length > 0) {
+    guestList = attendees.map((guest) => ({ id: guest.id, name: guest.name, tier: guest.tier, table: guest.table_name }));
+  } else if (guestList.length > 0) {
+    await saveGuestsToSupabase(guestList);
+  }
+
+  const checkInsResponse = await supabaseRequest('event_checkins?select=attendee_id,name,checked_in_at');
+  if (!checkInsResponse.ok) throw new Error(`Supabase check-in load failed (${checkInsResponse.status})`);
+  const saved = await checkInsResponse.json() as Array<{ attendee_id: string; name: string; checked_in_at: string }>;
+  saved.forEach((record) => checkIns.set(record.attendee_id, {
+    attendeeId: record.attendee_id,
+    name: record.name,
+    checkedInAt: record.checked_in_at,
+  }));
+}
 
 try {
-  if (fs.existsSync(CSV_PATH)) {
-    const raw = fs.readFileSync(CSV_PATH, 'utf-8');
-    guestList = parseCSV(raw);
+  if (fs.existsSync(CHECKINS_PATH)) {
+    const saved = JSON.parse(fs.readFileSync(CHECKINS_PATH, 'utf8')) as CheckIn[];
+    saved.forEach((record) => checkIns.set(record.attendeeId, record));
   }
-} catch (e) {
-  console.error('Error reading initial CSV:', e);
+} catch (error) {
+  console.error('Unable to read saved check-ins:', error);
 }
 
-// Endpoints for CSV management
+function persistCheckIns() {
+  fs.mkdirSync(DATA_PATH, { recursive: true });
+  fs.writeFileSync(CHECKINS_PATH, JSON.stringify([...checkIns.values()], null, 2), 'utf8');
+}
+
+function normalizeName(value: string) {
+  return value
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function similarity(left: string, right: string) {
+  if (!left || !right) return 0;
+  const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= left.length; i += 1) {
+    let diagonal = previous[0];
+    previous[0] = i;
+    for (let j = 1; j <= right.length; j += 1) {
+      const above = previous[j];
+      previous[j] = Math.min(
+        previous[j] + 1,
+        previous[j - 1] + 1,
+        diagonal + (left[i - 1] === right[j - 1] ? 0 : 1),
+      );
+      diagonal = above;
+    }
+  }
+  return 1 - previous[right.length] / Math.max(left.length, right.length);
+}
+
+function scoreName(query: string, guestName: string) {
+  const q = normalizeName(query);
+  const name = normalizeName(guestName);
+  if (q === name) return 1;
+  const qWords = new Set(q.split(' ').filter(Boolean));
+  const nameWords = new Set(name.split(' ').filter(Boolean));
+  const overlap = [...qWords].filter((word) => nameWords.has(word)).length;
+  const tokenScore = overlap / Math.max(qWords.size, nameWords.size, 1);
+  return Math.max(similarity(q, name), tokenScore);
+}
+
 app.get('/api/invitations', (_req, res) => {
-  res.json({ guests: guestList });
+  res.json({ total: guestList.length, checkedIn: guestList.filter((guest) => checkIns.has(guest.id)).length });
 });
 
-app.post('/api/invitations', (req, res) => {
+app.post('/api/invitations', async (req, res) => {
+  const csvContent = typeof req.body?.csvContent === 'string' ? req.body.csvContent : '';
+  const parsed = parseCSV(csvContent);
+  if (parsed.length === 0) {
+    return res.status(400).json({ error: 'The CSV must include a header row and attendee names.' });
+  }
+
   try {
-    const { csvContent } = req.body;
-    if (!csvContent) {
-      return res.status(400).json({ error: 'No CSV content provided' });
-    }
-
-    const parsed = parseCSV(csvContent);
-    if (parsed.length === 0) {
-      return res.status(400).json({ error: 'Could not find any guest rows in CSV' });
-    }
-
+    if (hasSupabase) await saveGuestsToSupabase(parsed);
+    fs.mkdirSync(DATA_PATH, { recursive: true });
+    fs.writeFileSync(CSV_PATH, csvContent, 'utf8');
     guestList = parsed;
-
-    // Save to disk
-    try {
-      fs.writeFileSync(CSV_PATH, csvContent, 'utf-8');
-    } catch (err) {
-      console.warn('Could not persist to disk, keeping in memory', err);
-    }
-
-    return res.json({ success: true, count: guestList.length, guests: guestList });
+    return res.json({ success: true, count: guestList.length });
   } catch (error) {
-    console.error('Error uploading CSV:', error);
-    return res.status(500).json({ error: 'Failed to process CSV' });
+    console.error('Unable to save attendee list:', error);
+    return res.status(500).json({ error: 'The attendee list could not be saved. Check the server storage settings.' });
   }
 });
 
-// Fast fuzzy matching function
-function findGuestFuzzy(queryName: string) {
-  if (!queryName) return null;
-  const q = queryName.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
+app.post('/api/check-in/lookup', (req, res) => {
+  const spokenName = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+  if (spokenName.length < 2) {
+    return res.status(400).json({ error: 'Please provide the attendee name to search for.' });
+  }
 
-  // 1. Direct match
-  const direct = guestList.find(
-    (g) => g.name.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim() === q
-  );
-  if (direct) return direct;
+  const ranked = guestList
+    .map((guest) => ({ guest, score: scoreName(spokenName, guest.name) }))
+    .filter((match) => match.score >= 0.38)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 4);
 
-  // 2. Contains match
-  const contains = guestList.find((g) => {
-    const gn = g.name.toLowerCase();
-    return gn.includes(q) || q.includes(gn);
-  });
-  if (contains) return contains;
+  if (ranked.length === 0) return res.json({ status: 'none', candidates: [] });
+  const ambiguous = ranked.length > 1 && ranked[0].score - ranked[1].score < 0.08;
+  const matches = (ambiguous ? ranked : ranked.slice(0, 1)).map(({ guest }) => ({
+    ...guest,
+    checkedInAt: checkIns.get(guest.id)?.checkedInAt ?? null,
+  }));
 
-  // 3. Word token overlap
-  const qWords = q.split(/\s+/).filter((w) => w.length > 2);
-  for (const guest of guestList) {
-    const gWords = guest.name.toLowerCase().split(/\s+/);
-    for (const qw of qWords) {
-      if (gWords.some((gw) => gw.includes(qw) || qw.includes(gw))) {
-        return guest;
+  return res.json({ status: ambiguous ? 'ambiguous' : 'one', candidates: matches });
+});
+
+app.post('/api/check-in/confirm', async (req, res) => {
+  const attendeeId = typeof req.body?.attendeeId === 'string' ? req.body.attendeeId : '';
+  const guest = guestList.find((item) => item.id === attendeeId);
+  if (!guest) return res.status(404).json({ error: 'That attendee is no longer on the list.' });
+
+  const existing = checkIns.get(guest.id);
+  if (existing) return res.json({ status: 'already-checked-in', guest, checkIn: existing });
+
+  const record: CheckIn = {
+    attendeeId: guest.id,
+    name: guest.name,
+    checkedInAt: new Date().toISOString(),
+  };
+  try {
+    if (hasSupabase) {
+      const response = await supabaseRequest('event_checkins?on_conflict=attendee_id', {
+        method: 'POST',
+        headers: { Prefer: 'resolution=ignore-duplicates,return=representation' },
+        body: JSON.stringify({ attendee_id: guest.id, name: guest.name, checked_in_at: record.checkedInAt }),
+      });
+      if (!response.ok) throw new Error(`Supabase check-in save failed (${response.status})`);
+      const inserted = await response.json() as Array<{ attendee_id: string; name: string; checked_in_at: string }>;
+      if (inserted.length === 0) {
+        const existingResponse = await supabaseRequest(`event_checkins?attendee_id=eq.${encodeURIComponent(guest.id)}&select=attendee_id,name,checked_in_at`);
+        if (!existingResponse.ok) throw new Error(`Supabase duplicate check-in read failed (${existingResponse.status})`);
+        const [existing] = await existingResponse.json() as Array<{ attendee_id: string; name: string; checked_in_at: string }>;
+        const existingCheckIn: CheckIn = {
+          attendeeId: existing.attendee_id,
+          name: existing.name,
+          checkedInAt: existing.checked_in_at,
+        };
+        checkIns.set(guest.id, existingCheckIn);
+        return res.json({ status: 'already-checked-in', guest, checkIn: existingCheckIn });
       }
     }
+    checkIns.set(guest.id, record);
+    if (!hasSupabase) persistCheckIns();
+  } catch (error) {
+    console.error('Unable to save check-in:', error);
+    return res.status(500).json({ error: 'The arrival could not be saved. Please ask staff to check in the guest.' });
   }
+  return res.json({ status: 'checked-in', guest, checkIn: record });
+});
 
-  return null;
-}
+app.get('/api/check-ins/stats', (_req, res) => {
+  res.json({ total: guestList.length, checkedIn: guestList.filter((guest) => checkIns.has(guest.id)).length });
+});
 
-// Ultra-fast instant invitation checking endpoint
-app.post('/api/check-invitation', (req, res) => {
-  const { name } = req.body;
-  const match = findGuestFuzzy(name || '');
+app.get('/api/voice-config', (_req, res) => {
+  const ready = Boolean(process.env.ELEVENLABS_API_KEY);
+  res.json({ realtimeListeningReady: ready, elevenLabsVoiceReady: ready && Boolean(process.env.ELEVENLABS_VOICE_ID) });
+});
 
-  if (match) {
-    return res.json({
-      found: true,
-      guest: match,
-      reply: `Looking at you closely. Welcome to the Vinicunca, ${match.name}. Your invitation is confirmed. Access is granted to ${match.table}.`,
+app.get('/api/scribe-token', async (_req, res) => {
+  const apiKey = process.env.ELEVENLABS_API_KEY;
+  if (!apiKey) return res.status(503).json({ error: 'ElevenLabs is not configured on the server yet.' });
+  try {
+    const response = await fetch('https://api.elevenlabs.io/v1/single-use-token/realtime_scribe', {
+      method: 'POST',
+      headers: { 'xi-api-key': apiKey },
     });
-  } else {
-    return res.json({
-      found: false,
-      reply: `Looking at you closely. I have searched our invitation sheet, but do not find a reservation under ${name || 'that name'}. Please check your credentials.`,
-    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || typeof body.token !== 'string') {
+      console.error('ElevenLabs Scribe token request failed:', response.status);
+      return res.status(502).json({ error: 'ElevenLabs could not start live listening. Check the API key and account access.' });
+    }
+    return res.json({ token: body.token });
+  } catch (error) {
+    console.error('ElevenLabs Scribe token request failed:', error);
+    return res.status(502).json({ error: 'Could not connect to ElevenLabs for live listening.' });
   }
 });
 
-// TheVinicunca real-time website knowledge cache (scraped from thevinicunca.com)
-let vinicuncaWebKnowledge = {
-  about: 'The Vinicunca is a connected ecosystem where creators, professionals, entrepreneurs and visionaries grow together, build thriving businesses, and create lasting impact.',
-  tagline: 'Architect. Belong. Create.',
-  afroTalentLab: 'Afro Talent Lab 2026 is a practical one-month education bootcamp built around real skills, real people, and real change, taking place from November 20 to December 20, 2026.',
-  ecosystem: 'The Vinicunca ecosystem unites eight connected worlds spanning Learning, Community, Marketplace, Consulting, AI Tools, The Forest, The Cave, and The Nest.',
-  forest: 'The Forest is dedicated to art and creativity, empowering artists across music, dance, fine art, interior design, and publishing.',
-  cave: 'The Cave is dedicated to architecture and interior design, transforming physical environments into enduring experiences.',
-  nest: 'The Nest is dedicated to beauty, wellness, and personal care.',
-  lastScraped: Date.now(),
-};
+app.post('/api/speak', async (req, res) => {
+  const apiKey = process.env.ELEVENLABS_API_KEY;
+  const voiceId = process.env.ELEVENLABS_VOICE_ID;
+  const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
+  if (!apiKey || !voiceId) return res.status(503).json({ error: 'ElevenLabs voice is not configured on the server yet.' });
+  if (!text || text.length > 700) return res.status(400).json({ error: 'Speech text must be between 1 and 700 characters.' });
 
-// Async background refresh of thevinicunca.com data
-async function scrapeVinicuncaWebsite() {
   try {
-    const response = await fetch('https://thevinicunca.com', { signal: AbortSignal.timeout(4000) });
-    if (!response.ok) return;
-    const html = await response.text();
-    const cleanText = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
-                          .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '')
-                          .replace(/<[^>]+>/g, ' ')
-                          .replace(/\s+/g, ' ')
-                          .trim();
-    if (cleanText.length > 500) {
-      vinicuncaWebKnowledge.lastScraped = Date.now();
+    const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}/stream?output_format=mp3_44100_128`, {
+      method: 'POST',
+      headers: {
+        'xi-api-key': apiKey,
+        'Content-Type': 'application/json',
+        Accept: 'audio/mpeg',
+      },
+      body: JSON.stringify({
+        text,
+        model_id: process.env.ELEVENLABS_TTS_MODEL_ID || 'eleven_flash_v2_5',
+        voice_settings: { stability: 0.48, similarity_boost: 0.78, style: 0.18, use_speaker_boost: true },
+      }),
+    });
+    if (!response.ok || !response.body) {
+      const message = await response.text().catch(() => 'ElevenLabs voice request failed.');
+      console.error('ElevenLabs TTS request failed:', response.status, message.slice(0, 300));
+      return res.status(502).json({ error: 'ElevenLabs could not generate the spoken reply.' });
     }
-  } catch (err) {
-    // Non-blocking fallback to cached knowledge
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Cache-Control', 'no-store');
+    Readable.fromWeb(response.body as never).pipe(res);
+  } catch (error) {
+    console.error('ElevenLabs TTS request failed:', error);
+    if (!res.headersSent) res.status(502).json({ error: 'Could not connect to ElevenLabs for speech.' });
   }
-}
-
-// Scrape on startup and refresh hourly
-scrapeVinicuncaWebsite();
-setInterval(scrapeVinicuncaWebsite, 60 * 60 * 1000);
-
-// Endpoint to answer any question about Vinicunca in sub-5ms
-app.post('/api/ask-vinicunca', (req, res) => {
-  const { question } = req.body;
-  const q = (question || '').toLowerCase();
-
-  let answer = '';
-  if (q.includes('afro talent lab') || q.includes('bootcamp')) {
-    answer = vinicuncaWebKnowledge.afroTalentLab;
-  } else if (q.includes('forest') || q.includes('art')) {
-    answer = vinicuncaWebKnowledge.forest;
-  } else if (q.includes('cave') || q.includes('architecture')) {
-    answer = vinicuncaWebKnowledge.cave;
-  } else if (q.includes('nest') || q.includes('beauty')) {
-    answer = vinicuncaWebKnowledge.nest;
-  } else if (q.includes('ecosystem') || q.includes('world')) {
-    answer = vinicuncaWebKnowledge.ecosystem;
-  } else if (q.includes('what is') || q.includes('who is') || q.includes('tell me about') || q.includes('vinicunca')) {
-    answer = `${vinicuncaWebKnowledge.about} Our philosophy is ${vinicuncaWebKnowledge.tagline}.`;
-  } else {
-    answer = vinicuncaWebKnowledge.about;
-  }
-
-  return res.json({ answer, cached: true });
 });
 
 async function startServer() {
   const isProd = process.env.NODE_ENV === 'production';
-  // Serve static assets from public folder (e.g. video files)
-  const publicPath = path.resolve(process.cwd(), 'public');
-  if (fs.existsSync(publicPath)) {
-    app.use(express.static(publicPath));
+  if (Boolean(SUPABASE_URL) !== Boolean(SUPABASE_SERVER_KEY)) {
+    console.error('Set SUPABASE_URL and SUPABASE_SECRET_KEY (or the legacy SUPABASE_SERVICE_ROLE_KEY), or leave both blank to use local storage.');
+    process.exitCode = 1;
+    return;
   }
+  if (hasSupabase) {
+    try {
+      await loadSupabaseData();
+      console.log(`Loaded ${guestList.length} attendees and ${checkIns.size} check-ins from Supabase.`);
+    } catch (error) {
+      console.error('Supabase could not be loaded. Server startup stopped to protect attendance data.', error);
+      process.exitCode = 1;
+      return;
+    }
+  }
+  const publicPath = path.resolve(process.cwd(), 'public');
+  if (fs.existsSync(publicPath)) app.use(express.static(publicPath));
 
   if (!isProd) {
     const vite = await createViteServer({
-      server: {
-        middlewareMode: true,
-        hmr: false,
-        ws: false,
-      },
+      server: { middlewareMode: true, hmr: false, ws: false },
       appType: 'spa',
     });
     app.use(vite.middlewares);
   } else {
     const distPath = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.resolve(distPath, 'index.html'));
-    });
+    app.get('*', (_req, res) => res.sendFile(path.resolve(distPath, 'index.html')));
   }
 
   app.listen(PORT, '0.0.0.0', () => {

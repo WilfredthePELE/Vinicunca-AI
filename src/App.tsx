@@ -9,78 +9,22 @@ import { Volume2 } from 'lucide-react';
 
 const OPTIMIZED_VIDEO_URL = '/video/vinicunca_1080p.mp4';
 const SEAMLESS_VIDEO_URL = '/video/vinicunca_seamless_turn.mp4';
-const SPEAKING_VIDEO_URL = '/video/vinicunca_speaking.mp4';
 const FALLBACK_VIDEO_URL =
   'https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260601_110537_3a579fa0-7bbc-4d94-9d25-0e816c7840f5.mp4';
 
 const WELCOME_PHRASE =
   'Welcome to the Vinicunca. What is your name so I confirm your invitation?';
 
-// Forward-facing timestamp in video (seconds)
-const FORWARD_FACE_TIME = 2.02;
-
 interface GuestRecord {
+  id: string;
   name: string;
   tier: string;
   table: string;
-}
-
-const DEFAULT_GUESTS: GuestRecord[] = [
-  { name: 'Wilfred Owubokiri', tier: 'Founding Dignitary', table: 'Sanctuary 01' },
-  { name: 'Elena Rostova', tier: 'Architectural Delegate', table: 'Sanctuary 02' },
-  { name: 'Julian Croft', tier: 'Patron of the Arts', table: 'Sanctuary 03' },
-  { name: 'Dr. Maya Lin', tier: 'Scientific Fellow', table: 'Sanctuary 01' },
-  { name: 'Marcus Vance', tier: 'Executive Envoy', table: 'Sanctuary 04' },
-  { name: 'Aria Sterling', tier: 'Special Envoy', table: 'Sanctuary 02' },
-  { name: 'David Kim', tier: 'Design Partner', table: 'Sanctuary 03' },
-  { name: 'Sophia Al-Mansoor', tier: 'Cultural Ambassador', table: 'Sanctuary 01' },
-  { name: 'Liam O\'Connor', tier: 'Guest of Honor', table: 'Sanctuary 04' },
-  { name: 'Camila Santos', tier: 'Curator', table: 'Sanctuary 02' },
-];
-
-function parseCSV(text: string): GuestRecord[] {
-  const lines = text.trim().split(/\r?\n/);
-  if (lines.length <= 1) return [];
-
-  const headers = lines[0].split(',').map((h) => h.trim().toLowerCase());
-  const nameIdx = headers.indexOf('name') !== -1 ? headers.indexOf('name') : 0;
-  const tierIdx = headers.indexOf('tier') !== -1 ? headers.indexOf('tier') : 1;
-  const tableIdx = headers.indexOf('table') !== -1 ? headers.indexOf('table') : 2;
-
-  const records: GuestRecord[] = [];
-  for (let i = 1; i < lines.length; i++) {
-    const row = lines[i];
-    if (!row.trim()) continue;
-
-    const values: string[] = [];
-    let insideQuotes = false;
-    let currentVal = '';
-    for (const char of row) {
-      if (char === '"') {
-        insideQuotes = !insideQuotes;
-      } else if (char === ',' && !insideQuotes) {
-        values.push(currentVal.trim());
-        currentVal = '';
-      } else {
-        currentVal += char;
-      }
-    }
-    values.push(currentVal.trim());
-
-    if (values[nameIdx]) {
-      records.push({
-        name: values[nameIdx],
-        tier: values[tierIdx] || 'Invited Guest',
-        table: values[tableIdx] || 'Main Pavilion',
-      });
-    }
-  }
-  return records;
+  checkedInAt?: string | null;
 }
 
 export default function App() {
-  const idleVideoRef = useRef<HTMLVideoElement>(null);
-  const speakingVideoRef = useRef<HTMLVideoElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
 
   // Parallax tracking
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
@@ -89,20 +33,34 @@ export default function App() {
   const [isAwake, setIsAwake] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isInspecting, setIsInspecting] = useState(false);
+  const [isListening, setIsListening] = useState(false);
+  const [statusText, setStatusText] = useState('Tap the button to start the welcome assistant.');
+  const [liveTranscript, setLiveTranscript] = useState('');
+  const [guestCount, setGuestCount] = useState(0);
+  const [checkedInCount, setCheckedInCount] = useState(0);
 
-  // Synchronous state refs
+  // Synchronous state refs to avoid effect race conditions
   const isAwakeRef = useRef(false);
   const isSpeakingRef = useRef(false);
   const isInspectingRef = useRef(false);
+  const phaseRef = useRef<'sleeping' | 'asking-name' | 'confirming' | 'checking'>('sleeping');
+  const pendingGuestRef = useRef<GuestRecord | null>(null);
+  const ignoredAudioUntilRef = useRef(0);
 
-  // In-memory guest registry
-  const guestListRef = useRef<GuestRecord[]>(DEFAULT_GUESTS);
-
-  // Audio & Speech refs
+  // Recognition and Speech refs
   const recognitionRef = useRef<any>(null);
   const isRecognizingRef = useRef(false);
   const shouldListenRef = useRef(true);
   const cachedFemaleVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
+  const speechResumeTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const socketRef = useRef<WebSocket | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const mutedGainRef = useRef<GainNode | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const isSpeakingNowRef = useRef(false);
 
   // Keep refs in sync with state
   useEffect(() => {
@@ -116,37 +74,6 @@ export default function App() {
   useEffect(() => {
     isInspectingRef.current = isInspecting;
   }, [isInspecting]);
-
-  // When avatar speaks: smoothly face the user directly and articulate actual mouth & jaw
-  useEffect(() => {
-    const idleVideo = idleVideoRef.current;
-    const speakingVideo = speakingVideoRef.current;
-
-    if (isSpeaking) {
-      if (speakingVideo) {
-        speakingVideo.currentTime = 0;
-        const playPromise = speakingVideo.play();
-        if (playPromise !== undefined) {
-          playPromise.catch(() => {});
-        }
-      }
-      if (idleVideo) {
-        idleVideo.currentTime = FORWARD_FACE_TIME;
-        idleVideo.pause();
-      }
-    } else {
-      if (speakingVideo) {
-        speakingVideo.pause();
-      }
-      if (idleVideo) {
-        idleVideo.playbackRate = 0.95;
-        const playPromise = idleVideo.play();
-        if (playPromise !== undefined) {
-          playPromise.catch(() => {});
-        }
-      }
-    }
-  }, [isSpeaking]);
 
   // Pre-load and cache the highest-quality female voice
   const updateFemaleVoice = useCallback(() => {
@@ -198,38 +125,53 @@ export default function App() {
     }
   }, [updateFemaleVoice]);
 
-  // Load server CSV silently on mount
+  // Load the event's aggregate arrival count without sending the full list to the browser.
   useEffect(() => {
-    fetch('/api/invitations')
-      .then((res) => {
-        if (!res.ok) throw new Error('Fetch failed');
-        return res.json();
-      })
+    fetch('/api/check-ins/stats')
+      .then((res) => res.ok ? res.json() : Promise.reject(new Error('Guest list unavailable')))
       .then((data) => {
-        if (data.guests && Array.isArray(data.guests) && data.guests.length > 0) {
-          guestListRef.current = data.guests;
-        }
+        setGuestCount(data.total ?? 0);
+        setCheckedInCount(data.checkedIn ?? 0);
       })
-      .catch(() => {});
+      .catch(() => {
+        setStatusText('Could not load the attendee list. Please ask the event team to check the server.');
+      });
   }, []);
 
-  // Safe video autoplay initialization
+  // Safe video autoplay with user-gesture resilience
   useEffect(() => {
-    const idleVideo = idleVideoRef.current;
-    if (idleVideo) {
-      idleVideo.muted = true;
-      idleVideo.loop = true;
-      idleVideo.playsInline = true;
-      idleVideo.play().catch(() => {});
-    }
+    const video = videoRef.current;
+    if (!video) return;
 
-    const speakingVideo = speakingVideoRef.current;
-    if (speakingVideo) {
-      speakingVideo.muted = true;
-      speakingVideo.loop = true;
-      speakingVideo.playsInline = true;
+    video.muted = true;
+    video.loop = true;
+    video.playsInline = true;
+
+    const playPromise = video.play();
+    if (playPromise !== undefined) {
+      playPromise.catch(() => {
+        // Autoplay may be restricted before user clicks, safe silent catch
+      });
     }
   }, []);
+
+  // Adjust video animation speed when speaking vs idle
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    try {
+      if (isInspecting) {
+        video.playbackRate = 0.85;
+      } else if (isSpeaking) {
+        video.playbackRate = 1.15;
+      } else {
+        video.playbackRate = 0.95;
+      }
+    } catch {
+      // Ignore if video element is not ready
+    }
+  }, [isSpeaking, isInspecting]);
 
   // Mouse parallax
   useEffect(() => {
@@ -244,296 +186,452 @@ export default function App() {
     return () => window.removeEventListener('mousemove', handleMouseMove);
   }, []);
 
-  // Fast, reliable female speech synthesis with word boundary alignment
+  // Use ElevenLabs for the event voice; retain the browser voice as an offline fallback.
   const speakInstantFemale = useCallback((text: string, onDone?: () => void) => {
-    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+    const finish = () => {
+      setIsSpeaking(false);
+      isSpeakingRef.current = false;
+      isSpeakingNowRef.current = false;
+      ignoredAudioUntilRef.current = Date.now() + 700;
       if (onDone) onDone();
+    };
+
+    const speakWithBrowserVoice = () => {
+      if (!('speechSynthesis' in window)) {
+        finish();
+        return;
+      }
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = 1;
+      utterance.pitch = 1.04;
+      utterance.volume = 1;
+      if (cachedFemaleVoiceRef.current) utterance.voice = cachedFemaleVoiceRef.current;
+      utterance.onend = finish;
+      utterance.onerror = finish;
+      window.speechSynthesis.speak(utterance);
+    };
+
+    setIsSpeaking(true);
+    isSpeakingRef.current = true;
+    isSpeakingNowRef.current = true;
+    setStatusText('Speaking');
+    if (speechResumeTimerRef.current) clearInterval(speechResumeTimerRef.current);
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+
+    fetch('/api/speak', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    })
+      .then(async (response) => {
+        if (!response.ok) throw new Error('ElevenLabs speech is unavailable');
+        const blob = await response.blob();
+        const audio = new Audio(URL.createObjectURL(blob));
+        audioRef.current = audio;
+        audio.onended = () => {
+          URL.revokeObjectURL(audio.src);
+          finish();
+        };
+        audio.onerror = () => {
+          URL.revokeObjectURL(audio.src);
+          speakWithBrowserVoice();
+        };
+        try {
+          await audio.play();
+        } catch {
+          speakWithBrowserVoice();
+        }
+      })
+      .catch(() => speakWithBrowserVoice());
+  }, []);
+
+  const refreshAttendance = useCallback(async () => {
+    const response = await fetch('/api/check-ins/stats');
+    if (!response.ok) throw new Error('Attendance refresh failed');
+    const stats = await response.json();
+    setGuestCount(stats.total ?? 0);
+    setCheckedInCount(stats.checkedIn ?? 0);
+  }, []);
+
+  const processGuestName = useCallback(async (spokenName: string) => {
+    const cleanName = spokenName
+      .replace(/\bmy name is\b/i, '')
+      .replace(/\bi am\b/i, '')
+      .replace(/\bi'm\b/i, '')
+      .replace(/\bthis is\b/i, '')
+      .replace(/\bplease\b/gi, '')
+      .trim();
+    if (cleanName.length < 2) {
+      speakInstantFemale('I did not catch your name. Please say your full name.');
       return;
     }
 
+    phaseRef.current = 'checking';
+    setIsInspecting(true);
+    isInspectingRef.current = true;
+    setStatusText(`Checking ${cleanName}`);
+
     try {
-      window.speechSynthesis.cancel();
-      setIsSpeaking(true);
-      isSpeakingRef.current = true;
+      const response = await fetch('/api/check-in/lookup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: cleanName }),
+      });
+      if (!response.ok) throw new Error('Attendee lookup failed');
+      const result = await response.json();
+      setIsInspecting(false);
+      isInspectingRef.current = false;
 
-      if (window.speechSynthesis.paused) {
-        window.speechSynthesis.resume();
-      }
-
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.rate = 1.0;
-      utterance.pitch = 1.06;
-      utterance.volume = 1.0;
-
-      if (cachedFemaleVoiceRef.current) {
-        utterance.voice = cachedFemaleVoiceRef.current;
-      }
-
-      // Subtle conversational speech cadence variation on spoken word boundary
-      utterance.onboundary = () => {
-        if (speakingVideoRef.current) {
-          speakingVideoRef.current.playbackRate = 1.0 + Math.random() * 0.15;
-        }
-      };
-
-      utterance.onend = () => {
-        setIsSpeaking(false);
-        isSpeakingRef.current = false;
-        if (onDone) onDone();
-      };
-
-      utterance.onerror = (e) => {
-        if (e.error !== 'canceled') {
-          console.warn('SpeechSynthesis error:', e.error);
-        }
-        setIsSpeaking(false);
-        isSpeakingRef.current = false;
-        if (onDone) onDone();
-      };
-
-      window.speechSynthesis.speak(utterance);
-    } catch (err) {
-      console.warn('Speech invocation failed:', err);
-      setIsSpeaking(false);
-      isSpeakingRef.current = false;
-      if (onDone) onDone();
-    }
-  }, []);
-
-  // Sub-millisecond instant fuzzy search in CSV list
-  const findGuestInstant = useCallback((query: string): GuestRecord | null => {
-    if (!query) return null;
-    const q = query.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
-    if (!q) return null;
-
-    const list = guestListRef.current;
-
-    const direct = list.find(
-      (g) => g.name.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim() === q
-    );
-    if (direct) return direct;
-
-    const substr = list.find((g) => {
-      const gn = g.name.toLowerCase();
-      return gn.includes(q) || q.includes(gn);
-    });
-    if (substr) return substr;
-
-    const qTokens = q.split(/\s+/).filter((t) => t.length > 2);
-    for (const guest of list) {
-      const gTokens = guest.name.toLowerCase().split(/\s+/);
-      for (const qt of qTokens) {
-        if (gTokens.some((gt) => gt.includes(qt) || qt.includes(gt))) {
-          return guest;
-        }
-      }
-    }
-
-    return null;
-  }, []);
-
-  // Process attendee inquiry (name verification or questions about Vinicunca)
-  const processGuestName = useCallback(
-    (rawTranscript: string) => {
-      const lower = rawTranscript.toLowerCase();
-      const isQuestion =
-        lower.includes('what is') ||
-        lower.includes('tell me') ||
-        lower.includes('explain') ||
-        lower.includes('about vinicunca') ||
-        lower.includes('ecosystem') ||
-        lower.includes('afro talent') ||
-        lower.includes('forest') ||
-        lower.includes('cave') ||
-        lower.includes('nest') ||
-        lower.includes('who are you');
-
-      if (isQuestion) {
-        setIsInspecting(true);
-        isInspectingRef.current = true;
-
-        fetch('/api/ask-vinicunca', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ question: rawTranscript }),
-        })
-          .then((res) => res.json())
-          .then((data) => {
-            speakInstantFemale(
-              data.answer ||
-                'The Vinicunca is a connected ecosystem where creators, entrepreneurs, and visionaries grow together, build thriving businesses, and create lasting impact.',
-              () => {
-                setIsInspecting(false);
-                isInspectingRef.current = false;
-              }
-            );
-          })
-          .catch(() => {
-            speakInstantFemale(
-              'The Vinicunca is a connected ecosystem where creators, professionals, and visionaries grow together.',
-              () => {
-                setIsInspecting(false);
-                isInspectingRef.current = false;
-              }
-            );
-          });
+      if (result.status === 'none' || !result.candidates?.length) {
+        phaseRef.current = 'asking-name';
+        setStatusText('Name not found; listening for another try');
+        speakInstantFemale(`Sorry, I could not find ${cleanName} on the guest list. Please say your full name again, or see the registration team.`);
         return;
       }
 
-      const cleanName = rawTranscript
-        .replace(/my name is/i, '')
-        .replace(/i am/i, '')
-        .replace(/this is/i, '')
-        .replace(/hey vinicunca/i, '')
-        .replace(/vinicunca/i, '')
-        .trim();
-
-      if (!cleanName || cleanName.length < 2) return;
-
-      setIsInspecting(true);
-      isInspectingRef.current = true;
-
-      const matched = findGuestInstant(cleanName);
-
-      let reply = '';
-      if (matched) {
-        reply = `Looking at you closely. Welcome to the Vinicunca, ${matched.name}. Your invitation is confirmed. Access is granted to ${matched.table}.`;
-      } else {
-        reply = `Looking at you closely. I have checked our invitation sheet for ${cleanName}, but do not see a confirmed reservation. Please check with reception.`;
+      if (result.status === 'ambiguous') {
+        phaseRef.current = 'asking-name';
+        const names = result.candidates.map((guest: GuestRecord) => guest.name).join(', ');
+        setStatusText('Several names are similar; asking for clarification');
+        speakInstantFemale(`I found a few similar names: ${names}. Please say your full name clearly, or see the registration team.`);
+        return;
       }
 
-      speakInstantFemale(reply, () => {
-        setIsInspecting(false);
-        isInspectingRef.current = false;
-      });
-    },
-    [findGuestInstant, speakInstantFemale]
-  );
+      const guest = result.candidates[0] as GuestRecord;
+      if (guest.checkedInAt) {
+        phaseRef.current = 'sleeping';
+        setIsAwake(false);
+        isAwakeRef.current = false;
+        setStatusText(`${guest.name} already checked in`);
+        speakInstantFemale(`${guest.name}, you are already checked in. Please enjoy the event.`);
+        return;
+      }
 
-  // Wake up handler
-  const handleWakeUp = useCallback(() => {
-    setIsAwake(true);
-    isAwakeRef.current = true;
-    speakInstantFemale(WELCOME_PHRASE);
+      pendingGuestRef.current = guest;
+      phaseRef.current = 'confirming';
+      setStatusText(`Confirming ${guest.name}`);
+      speakInstantFemale(`I found ${guest.name}. Your table is ${guest.table}. Is that you? Please say yes or no.`);
+    } catch (error) {
+      console.error(error);
+      phaseRef.current = 'asking-name';
+      setIsInspecting(false);
+      isInspectingRef.current = false;
+      setStatusText('Could not reach the attendee list');
+      speakInstantFemale('I am having trouble reaching the guest list. Please ask the registration team for help.');
+    }
   }, [speakInstantFemale]);
 
-  // Speech Recognition listener
-  useEffect(() => {
-    const SpeechRecognition =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-
-    if (!SpeechRecognition) return;
-
-    let recognition: any = null;
-    shouldListenRef.current = true;
-
+  const confirmGuestCheckIn = useCallback(async () => {
+    const guest = pendingGuestRef.current;
+    if (!guest) {
+      phaseRef.current = 'asking-name';
+      speakInstantFemale('Please tell me your full name again.');
+      return;
+    }
+    phaseRef.current = 'checking';
+    setStatusText(`Recording ${guest.name}`);
     try {
-      recognition = new SpeechRecognition();
-      recognition.continuous = true;
-      recognition.interimResults = false;
-      recognition.lang = 'en-US';
-
-      recognition.onstart = () => {
-        isRecognizingRef.current = true;
-      };
-
-      recognition.onresult = (event: any) => {
-        if (isSpeakingRef.current) return;
-
-        const lastResultIndex = event.results.length - 1;
-        const transcript = (event.results[lastResultIndex][0]?.transcript || '').trim();
-        const lower = transcript.toLowerCase();
-
-        if (lower.includes('vinicunca') || lower.includes('hey vinicunca')) {
-          handleWakeUp();
-          return;
-        }
-
-        if (isAwakeRef.current && transcript.length > 1) {
-          processGuestName(transcript);
-        }
-      };
-
-      recognition.onerror = () => {
-        isRecognizingRef.current = false;
-      };
-
-      recognition.onend = () => {
-        isRecognizingRef.current = false;
-        if (shouldListenRef.current && !isRecognizingRef.current) {
-          setTimeout(() => {
-            if (shouldListenRef.current && !isRecognizingRef.current && recognition) {
-              try {
-                recognition.start();
-              } catch {}
-            }
-          }, 400);
-        }
-      };
-
-      recognitionRef.current = recognition;
-
-      try {
-        recognition.start();
-      } catch {}
-    } catch {}
-
-    return () => {
-      shouldListenRef.current = false;
-      if (recognition) {
-        try {
-          recognition.abort();
-        } catch {}
+      const response = await fetch('/api/check-in/confirm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ attendeeId: guest.id }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Check-in could not be saved');
+      pendingGuestRef.current = null;
+      await refreshAttendance();
+      phaseRef.current = 'sleeping';
+      setIsAwake(false);
+      isAwakeRef.current = false;
+      if (result.status === 'already-checked-in') {
+        setStatusText(`${guest.name} already checked in`);
+        speakInstantFemale(`${guest.name}, you are already checked in. Please enjoy the event.`);
+      } else {
+        setStatusText(`${guest.name} is checked in`);
+        speakInstantFemale(`Welcome to the Vinicunca, ${guest.name}. Your check-in is complete. Your table is ${guest.table}.`);
       }
-    };
-  }, [handleWakeUp, processGuestName]);
-
-  // Central Speaker Button handler
-  const handleCentralSpeakerClick = () => {
-    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-      if (window.speechSynthesis.paused) {
-        window.speechSynthesis.resume();
-      }
+    } catch (error) {
+      console.error(error);
+      phaseRef.current = 'confirming';
+      setStatusText('Could not save the check-in');
+      speakInstantFemale('I could not save your check-in just now. Please ask the registration team for help.');
     }
+  }, [refreshAttendance, speakInstantFemale]);
 
-    if (recognitionRef.current && !isRecognizingRef.current) {
-      try {
-        recognitionRef.current.start();
-      } catch {}
-    }
+  const handleTranscript = useCallback((transcript: string) => {
+    const text = transcript.trim();
+    if (!text || isSpeakingNowRef.current || Date.now() < ignoredAudioUntilRef.current) return;
+    setLiveTranscript(text);
+    const lower = text.toLowerCase().replace(/[^a-z0-9\s']/g, ' ').replace(/\s+/g, ' ').trim();
 
-    if (isSpeaking) {
-      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-        window.speechSynthesis.cancel();
+    if (phaseRef.current === 'sleeping') {
+      const wake = /\b(?:hey\s+)?(vini|vinicunca)\b/i.exec(lower);
+      if (!wake) return;
+      setIsAwake(true);
+      isAwakeRef.current = true;
+      phaseRef.current = 'asking-name';
+      const afterWake = lower.slice(wake.index + wake[0].length).replace(/^[,\s]+/, '').trim();
+      if (afterWake.length > 2 && !/^(please|hello|hi|are you there)$/.test(afterWake)) {
+        void processGuestName(afterWake);
+      } else {
+        setStatusText('Listening for the attendee name');
+        speakInstantFemale(WELCOME_PHRASE);
       }
-      setIsSpeaking(false);
-      isSpeakingRef.current = false;
       return;
     }
 
-    handleWakeUp();
+    if (phaseRef.current === 'asking-name') {
+      if (phaseRef.current !== 'checking') void processGuestName(text);
+      return;
+    }
+    if (phaseRef.current === 'confirming') {
+      if (/^(yes|yeah|yep|correct|that's me|that is me|it is|i am|i'm)(\b|$)/i.test(lower)) {
+        void confirmGuestCheckIn();
+      } else if (/^(no|nope|not me|that's not me|that is not me)(\b|$)/i.test(lower)) {
+        pendingGuestRef.current = null;
+        phaseRef.current = 'asking-name';
+        setStatusText('Listening for the correct attendee name');
+        speakInstantFemale('No problem. Please say your full name again.');
+      } else {
+        speakInstantFemale('Please say yes if that is you, or no if it is not.');
+      }
+    }
+  }, [confirmGuestCheckIn, processGuestName, speakInstantFemale]);
+
+  const startBrowserRecognition = useCallback(() => {
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      setStatusText('Live listening is unavailable in this browser. Use Chrome or Edge and allow microphone access.');
+      setIsListening(false);
+      return;
+    }
+    try {
+      const recognition = new SpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = 'en-NG';
+      recognition.onstart = () => {
+        isRecognizingRef.current = true;
+        setIsListening(true);
+        setStatusText('Listening with browser speech recognition');
+      };
+      recognition.onresult = (event: any) => {
+        for (let i = event.resultIndex; i < event.results.length; i += 1) {
+          const result = event.results[i];
+          if (result.isFinal && result[0]?.transcript) handleTranscript(result[0].transcript);
+          else if (result[0]?.transcript) setLiveTranscript(result[0].transcript);
+        }
+      };
+      recognition.onerror = (event: any) => {
+        if (event.error === 'not-allowed') {
+          shouldListenRef.current = false;
+          setIsListening(false);
+          setStatusText('Microphone permission was denied. Allow microphone access and try again.');
+        }
+      };
+      recognition.onend = () => {
+        isRecognizingRef.current = false;
+        if (shouldListenRef.current) {
+          window.setTimeout(() => {
+            if (!shouldListenRef.current) return;
+            try { recognition.start(); } catch { /* Browser is already restarting. */ }
+          }, 350);
+        }
+      };
+      recognitionRef.current = recognition;
+      recognition.start();
+    } catch (error) {
+      console.error('Browser speech recognition could not start:', error);
+      setIsListening(false);
+      setStatusText('Could not start the microphone. Check browser permissions.');
+    }
+  }, [handleTranscript]);
+
+  const startRealtimeListening = useCallback(async () => {
+    shouldListenRef.current = true;
+    setStatusText('Connecting to live listening');
+    try {
+      let context = audioContextRef.current;
+      if (!context || context.state === 'closed') {
+        context = new AudioContext();
+        audioContextRef.current = context;
+      }
+      await context.resume();
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      streamRef.current = stream;
+      const tokenResponse = await fetch('/api/scribe-token');
+      if (!tokenResponse.ok) throw new Error('ElevenLabs live transcription is not configured');
+      const { token } = await tokenResponse.json();
+      if (!token) throw new Error('ElevenLabs did not return a temporary token');
+
+      const params = new URLSearchParams({
+        model_id: 'scribe_v2_realtime',
+        audio_format: 'pcm_16000',
+        sample_rate: '16000',
+        commit_strategy: 'vad',
+        language_code: 'en',
+        keepalive_interval_ms: '1000',
+      });
+      params.append('keyterms', 'Vinicunca');
+      params.append('keyterms', 'Vini');
+      const socket = new WebSocket(`wss://api.elevenlabs.io/v1/speech-to-text/realtime?${params.toString()}&token=${encodeURIComponent(token)}`);
+      socketRef.current = socket;
+
+      socket.onopen = () => setStatusText('Starting live listening');
+      socket.onmessage = (event) => {
+        let message: any;
+        try { message = JSON.parse(event.data); } catch { return; }
+        if (message.message_type === 'session_started') {
+          setIsListening(true);
+          setStatusText('Listening for your name');
+          phaseRef.current = 'asking-name';
+          setIsAwake(true);
+          isAwakeRef.current = true;
+          const audioContext = audioContextRef.current;
+          if (!audioContext) {
+            setStatusText('Audio could not be initialized. Click to restart.');
+            socket.close();
+            return;
+          }
+          const source = audioContext.createMediaStreamSource(stream);
+          const processor = audioContext.createScriptProcessor(4096, 1, 1);
+          const mutedGain = audioContext.createGain();
+          mutedGain.gain.value = 0;
+          sourceRef.current = source;
+          processorRef.current = processor;
+          mutedGainRef.current = mutedGain;
+          processor.onaudioprocess = (audioEvent) => {
+            if (socket.readyState !== WebSocket.OPEN) return;
+            const suppressMicrophone = isSpeakingNowRef.current || Date.now() < ignoredAudioUntilRef.current;
+            const input = audioEvent.inputBuffer.getChannelData(0);
+            const ratio = audioContext.sampleRate / 16000;
+            const outputLength = Math.floor(input.length / ratio);
+            const pcm = new Int16Array(outputLength);
+            for (let i = 0; i < outputLength; i += 1) {
+              if (suppressMicrophone) continue;
+              const position = i * ratio;
+              const low = Math.floor(position);
+              const fraction = position - low;
+              const sample = input[low] * (1 - fraction) + (input[Math.min(low + 1, input.length - 1)] || 0) * fraction;
+              const clipped = Math.max(-1, Math.min(1, sample));
+              pcm[i] = clipped < 0 ? clipped * 32768 : clipped * 32767;
+            }
+            const bytes = new Uint8Array(pcm.buffer);
+            let binary = '';
+            for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+            socket.send(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: btoa(binary) }));
+          };
+          source.connect(processor);
+          processor.connect(mutedGain);
+          mutedGain.connect(context.destination);
+          void speakInstantFemale(WELCOME_PHRASE);
+        } else if (message.message_type === 'partial_transcript') {
+          if (message.text) setLiveTranscript(message.text);
+        } else if (message.message_type === 'committed_transcript') {
+          if (message.text) handleTranscript(message.text);
+        } else if (message.message_type === 'error' || message.message_type === 'rate_limited') {
+          console.error('Scribe transcription error:', message);
+          setStatusText('Live listening encountered a problem. Check the account and connection.');
+          socket.close();
+        }
+      };
+      socket.onerror = () => setStatusText('Live listening connection failed. Check your internet and ElevenLabs setup.');
+      socket.onclose = () => {
+        if (shouldListenRef.current) {
+          setStatusText('Switching to browser speech recognition');
+          stopListeningResources();
+          shouldListenRef.current = true;
+          startBrowserRecognition();
+        }
+      };
+    } catch (error) {
+      console.warn('ElevenLabs realtime listening unavailable; using browser fallback.', error);
+      stopListeningResources();
+      shouldListenRef.current = true;
+      startBrowserRecognition();
+    }
+  }, [handleTranscript, speakInstantFemale, startBrowserRecognition]);
+
+  const stopListeningResources = useCallback(() => {
+    processorRef.current?.disconnect();
+    sourceRef.current?.disconnect();
+    mutedGainRef.current?.disconnect();
+    processorRef.current = null;
+    sourceRef.current = null;
+    mutedGainRef.current = null;
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') void audioContextRef.current.close();
+    audioContextRef.current = null;
+    recognitionRef.current?.abort?.();
+    recognitionRef.current = null;
+    isRecognizingRef.current = false;
+    socketRef.current?.close();
+    socketRef.current = null;
+    setIsListening(false);
+  }, []);
+
+  useEffect(() => () => {
+    shouldListenRef.current = false;
+    stopListeningResources();
+    audioRef.current?.pause();
+    if (speechResumeTimerRef.current) clearInterval(speechResumeTimerRef.current);
+  }, [stopListeningResources]);
+
+  const handleCentralSpeakerClick = () => {
+    if (isListening) {
+      shouldListenRef.current = false;
+      stopListeningResources();
+      setStatusText('Assistant paused');
+      phaseRef.current = 'sleeping';
+      return;
+    }
+    setIsListening(true);
+    void startRealtimeListening();
   };
 
-  // Drag-and-drop CSV upload
+  const importGuestCsv = useCallback((file: File) => {
+    if (!file.name.toLowerCase().endsWith('.csv') && !file.type.includes('csv')) {
+      setStatusText('Please choose a CSV file for the guest list.');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      const content = event.target?.result as string;
+      if (!content) return;
+      try {
+        const response = await fetch('/api/invitations', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ csvContent: content }),
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'Could not import that guest list');
+        await refreshAttendance();
+        setStatusText(`Guest list loaded: ${result.count} people`);
+        speakInstantFemale(`Guest list updated with ${result.count} attendees.`);
+      } catch (error) {
+        console.error(error);
+        setStatusText('Guest list upload failed');
+        speakInstantFemale('I could not load that guest list. Please check the CSV file and try again.');
+      }
+    };
+    reader.readAsText(file);
+  }, [refreshAttendance, speakInstantFemale]);
+
+  // Keep drag-and-drop guest list import, and save the new list through the backend.
   useEffect(() => {
-    const handleDragOver = (e: DragEvent) => e.preventDefault();
+    const handleDragOver = (e: DragEvent) => {
+      e.preventDefault();
+    };
+
     const handleDrop = (e: DragEvent) => {
       e.preventDefault();
       const file = e.dataTransfer?.files?.[0];
-      if (file && (file.name.endsWith('.csv') || file.type.includes('csv'))) {
-        const reader = new FileReader();
-        reader.onload = (event) => {
-          const content = event.target?.result as string;
-          if (content) {
-            const parsed = parseCSV(content);
-            if (parsed.length > 0) {
-              guestListRef.current = parsed;
-              speakInstantFemale(`Invitation sheet updated with ${parsed.length} guests.`);
-            }
-          }
-        };
-        reader.readAsText(file);
-      }
+      if (file) importGuestCsv(file);
     };
 
     window.addEventListener('dragover', handleDragOver);
@@ -542,18 +640,18 @@ export default function App() {
       window.removeEventListener('dragover', handleDragOver);
       window.removeEventListener('drop', handleDrop);
     };
-  }, [speakInstantFemale]);
+  }, [importGuestCsv]);
 
   return (
     <div className="relative w-screen h-screen min-h-screen bg-[#ECECE9] text-neutral-900 font-sans antialiased overflow-hidden select-none flex items-center justify-center">
-      {/* Centralized Animated Head/Body */}
+      {/* Centralized Animated Head with Smooth Continuous Left-to-Right and Right-to-Left Turn */}
       <motion.div
         className="absolute inset-0 flex items-center justify-center pointer-events-none overflow-hidden"
         animate={{
-          x: mousePos.x * 12 + (isSpeaking ? Math.sin(Date.now() / 150) * 1.5 : 0),
-          y: mousePos.y * 8 + (isSpeaking ? Math.cos(Date.now() / 150) * 2 : 0),
-          rotateY: isSpeaking ? mousePos.x * 2 : mousePos.x * 5,
-          rotateX: isSpeaking ? 0 : -mousePos.y * 5,
+          x: mousePos.x * 12 + (isSpeaking ? Math.sin(Date.now() / 150) * 2 : 0),
+          y: mousePos.y * 8 + (isSpeaking ? Math.cos(Date.now() / 150) * 2.5 : 0),
+          rotateY: mousePos.x * 5,
+          rotateX: -mousePos.y * 5,
           scale: isInspecting ? 1.25 : 1.05,
         }}
         transition={{
@@ -567,10 +665,9 @@ export default function App() {
           transformStyle: 'preserve-3d',
         }}
       >
-        {/* Continuous Ping-Pong Head Turning Video centered on avatar face */}
-        {/* Continuous Ping-Pong Head Turning Video (Idle graceful turning) */}
+        {/* Seamless Continuous Head Turning Video (1080p FastStart with multi-tier fallbacks) */}
         <video
-          ref={idleVideoRef}
+          ref={videoRef}
           autoPlay
           loop
           muted
@@ -584,26 +681,10 @@ export default function App() {
               target.src = FALLBACK_VIDEO_URL;
             }
           }}
-          className={`w-full h-full object-cover object-[71.5%_35.5%] transition-opacity duration-300 ${
-            isSpeaking ? 'opacity-0 pointer-events-none' : 'opacity-100'
-          }`}
+          className="w-full h-full object-cover object-center"
         >
           <source src={OPTIMIZED_VIDEO_URL} type="video/mp4" />
           <source src={SEAMLESS_VIDEO_URL} type="video/mp4" />
-        </video>
-
-        {/* Dynamic Speaking Video: Avatar faces the user directly & moves its actual mouth and jaw */}
-        <video
-          ref={speakingVideoRef}
-          loop
-          muted
-          playsInline
-          preload="auto"
-          className={`absolute inset-0 w-full h-full object-cover object-[71.5%_35.5%] transition-opacity duration-300 pointer-events-none ${
-            isSpeaking ? 'opacity-100' : 'opacity-0'
-          }`}
-        >
-          <source src={SPEAKING_VIDEO_URL} type="video/mp4" />
         </video>
 
         {/* Ethereal speaking aura */}
@@ -645,6 +726,30 @@ export default function App() {
 
       {/* Central Speaker Button (Clean, Only Control) */}
       <div className="fixed bottom-10 sm:bottom-12 inset-x-0 flex flex-col items-center justify-center z-30 pointer-events-auto">
+        <div className="mb-5 max-w-[min(92vw,560px)] rounded-2xl border border-white/50 bg-white/75 px-5 py-3 text-center shadow-lg shadow-black/5 backdrop-blur-xl">
+          <div className="flex items-center justify-center gap-2 text-sm font-medium text-neutral-800">
+            <span className={`h-2 w-2 rounded-full ${isListening ? 'bg-emerald-500 animate-pulse' : 'bg-neutral-400'}`} />
+            <span>{statusText}</span>
+          </div>
+          {liveTranscript && isListening && <p className="mt-1 max-w-full truncate text-xs text-neutral-600" aria-live="polite">Heard: {liveTranscript}</p>}
+          <div className="mt-2 flex items-center justify-center gap-3 text-[11px] tracking-wide text-neutral-500">
+            <span>{checkedInCount} / {guestCount} checked in</span>
+            {isListening && !isAwake && <span>Say &quot;Hey Vini&quot; or &quot;Hey Vinicunca&quot;</span>}
+            <label className="cursor-pointer underline underline-offset-2 hover:text-neutral-800">
+              Load guest CSV
+              <input
+                type="file"
+                accept=".csv,text/csv"
+                className="sr-only"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) importGuestCsv(file);
+                  event.target.value = '';
+                }}
+              />
+            </label>
+          </div>
+        </div>
         <div className="relative flex items-center justify-center">
           {/* Animated acoustic soundwave rings when speaking */}
           {isSpeaking && (
@@ -675,8 +780,8 @@ export default function App() {
                 ? 'bg-neutral-900 text-white shadow-neutral-950/20'
                 : 'bg-white/85 hover:bg-white text-neutral-900 backdrop-blur-xl border border-neutral-200/80 shadow-black/10'
             }`}
-            aria-label={isSpeaking ? 'Mute Vinicunca' : 'Wake Vinicunca'}
-            title="Click to speak with Vinicunca (or say 'Hey Vinicunca')"
+            aria-label={isListening ? 'Pause Vinicunca assistant' : 'Start Vinicunca assistant'}
+            title={isListening ? 'Pause the assistant' : 'Start the assistant and greet the next guest'}
           >
             <Volume2 className="w-7 h-7 sm:w-8 sm:h-8 stroke-[1.8]" />
           </motion.button>
