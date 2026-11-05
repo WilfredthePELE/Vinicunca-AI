@@ -9,11 +9,15 @@ import { Volume2 } from 'lucide-react';
 
 const OPTIMIZED_VIDEO_URL = '/video/vinicunca_1080p.mp4';
 const SEAMLESS_VIDEO_URL = '/video/vinicunca_seamless_turn.mp4';
+const SPEAKING_VIDEO_URL = '/video/vinicunca_speaking.mp4';
 const FALLBACK_VIDEO_URL =
   'https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260601_110537_3a579fa0-7bbc-4d94-9d25-0e816c7840f5.mp4';
 
 const WELCOME_PHRASE =
   'Welcome to the Vinicunca. What is your name so I confirm your invitation?';
+
+// Forward-facing timestamp in video (seconds)
+const FORWARD_FACE_TIME = 2.02;
 
 interface GuestRecord {
   name: string;
@@ -75,7 +79,8 @@ function parseCSV(text: string): GuestRecord[] {
 }
 
 export default function App() {
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const idleVideoRef = useRef<HTMLVideoElement>(null);
+  const speakingVideoRef = useRef<HTMLVideoElement>(null);
 
   // Parallax tracking
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
@@ -85,7 +90,7 @@ export default function App() {
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isInspecting, setIsInspecting] = useState(false);
 
-  // Synchronous state refs to avoid effect race conditions
+  // Synchronous state refs
   const isAwakeRef = useRef(false);
   const isSpeakingRef = useRef(false);
   const isInspectingRef = useRef(false);
@@ -93,12 +98,11 @@ export default function App() {
   // In-memory guest registry
   const guestListRef = useRef<GuestRecord[]>(DEFAULT_GUESTS);
 
-  // Recognition and Speech refs
+  // Audio & Speech refs
   const recognitionRef = useRef<any>(null);
   const isRecognizingRef = useRef(false);
   const shouldListenRef = useRef(true);
   const cachedFemaleVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
-  const speechResumeTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Keep refs in sync with state
   useEffect(() => {
@@ -112,6 +116,37 @@ export default function App() {
   useEffect(() => {
     isInspectingRef.current = isInspecting;
   }, [isInspecting]);
+
+  // When avatar speaks: smoothly face the user directly and articulate actual mouth & jaw
+  useEffect(() => {
+    const idleVideo = idleVideoRef.current;
+    const speakingVideo = speakingVideoRef.current;
+
+    if (isSpeaking) {
+      if (speakingVideo) {
+        speakingVideo.currentTime = 0;
+        const playPromise = speakingVideo.play();
+        if (playPromise !== undefined) {
+          playPromise.catch(() => {});
+        }
+      }
+      if (idleVideo) {
+        idleVideo.currentTime = FORWARD_FACE_TIME;
+        idleVideo.pause();
+      }
+    } else {
+      if (speakingVideo) {
+        speakingVideo.pause();
+      }
+      if (idleVideo) {
+        idleVideo.playbackRate = 0.95;
+        const playPromise = idleVideo.play();
+        if (playPromise !== undefined) {
+          playPromise.catch(() => {});
+        }
+      }
+    }
+  }, [isSpeaking]);
 
   // Pre-load and cache the highest-quality female voice
   const updateFemaleVoice = useCallback(() => {
@@ -175,45 +210,26 @@ export default function App() {
           guestListRef.current = data.guests;
         }
       })
-      .catch(() => {
-        // Safe silent fallback to DEFAULT_GUESTS
-      });
+      .catch(() => {});
   }, []);
 
-  // Safe video autoplay with user-gesture resilience
+  // Safe video autoplay initialization
   useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
+    const idleVideo = idleVideoRef.current;
+    if (idleVideo) {
+      idleVideo.muted = true;
+      idleVideo.loop = true;
+      idleVideo.playsInline = true;
+      idleVideo.play().catch(() => {});
+    }
 
-    video.muted = true;
-    video.loop = true;
-    video.playsInline = true;
-
-    const playPromise = video.play();
-    if (playPromise !== undefined) {
-      playPromise.catch(() => {
-        // Autoplay may be restricted before user clicks, safe silent catch
-      });
+    const speakingVideo = speakingVideoRef.current;
+    if (speakingVideo) {
+      speakingVideo.muted = true;
+      speakingVideo.loop = true;
+      speakingVideo.playsInline = true;
     }
   }, []);
-
-  // Adjust video animation speed when speaking vs idle
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-
-    try {
-      if (isInspecting) {
-        video.playbackRate = 0.85;
-      } else if (isSpeaking) {
-        video.playbackRate = 1.15;
-      } else {
-        video.playbackRate = 0.95;
-      }
-    } catch {
-      // Ignore if video element is not ready
-    }
-  }, [isSpeaking, isInspecting]);
 
   // Mouse parallax
   useEffect(() => {
@@ -228,7 +244,7 @@ export default function App() {
     return () => window.removeEventListener('mousemove', handleMouseMove);
   }, []);
 
-  // Fast, reliable, error-handled speech synthesis
+  // Fast, reliable female speech synthesis with word boundary alignment
   const speakInstantFemale = useCallback((text: string, onDone?: () => void) => {
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
       if (onDone) onDone();
@@ -236,12 +252,10 @@ export default function App() {
     }
 
     try {
-      // Clear previous utterance
       window.speechSynthesis.cancel();
       setIsSpeaking(true);
       isSpeakingRef.current = true;
 
-      // Chrome speech resume bug safeguard
       if (window.speechSynthesis.paused) {
         window.speechSynthesis.resume();
       }
@@ -255,6 +269,13 @@ export default function App() {
         utterance.voice = cachedFemaleVoiceRef.current;
       }
 
+      // Subtle conversational speech cadence variation on spoken word boundary
+      utterance.onboundary = () => {
+        if (speakingVideoRef.current) {
+          speakingVideoRef.current.playbackRate = 1.0 + Math.random() * 0.15;
+        }
+      };
+
       utterance.onend = () => {
         setIsSpeaking(false);
         isSpeakingRef.current = false;
@@ -262,7 +283,6 @@ export default function App() {
       };
 
       utterance.onerror = (e) => {
-        // Ignore canceled speech error events
         if (e.error !== 'canceled') {
           console.warn('SpeechSynthesis error:', e.error);
         }
@@ -272,16 +292,6 @@ export default function App() {
       };
 
       window.speechSynthesis.speak(utterance);
-
-      // Keep speech synthesis active on longer phrases (Chrome bug workaround)
-      if (speechResumeTimerRef.current) clearInterval(speechResumeTimerRef.current);
-      speechResumeTimerRef.current = setInterval(() => {
-        if (!window.speechSynthesis.speaking) {
-          if (speechResumeTimerRef.current) clearInterval(speechResumeTimerRef.current);
-        } else if (window.speechSynthesis.paused) {
-          window.speechSynthesis.resume();
-        }
-      }, 3000);
     } catch (err) {
       console.warn('Speech invocation failed:', err);
       setIsSpeaking(false);
@@ -298,20 +308,17 @@ export default function App() {
 
     const list = guestListRef.current;
 
-    // 1. Direct equality
     const direct = list.find(
       (g) => g.name.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim() === q
     );
     if (direct) return direct;
 
-    // 2. Substring matching
     const substr = list.find((g) => {
       const gn = g.name.toLowerCase();
       return gn.includes(q) || q.includes(gn);
     });
     if (substr) return substr;
 
-    // 3. Word token matching
     const qTokens = q.split(/\s+/).filter((t) => t.length > 2);
     for (const guest of list) {
       const gTokens = guest.name.toLowerCase().split(/\s+/);
@@ -325,9 +332,54 @@ export default function App() {
     return null;
   }, []);
 
-  // Process attendee name with zero delay
+  // Process attendee inquiry (name verification or questions about Vinicunca)
   const processGuestName = useCallback(
     (rawTranscript: string) => {
+      const lower = rawTranscript.toLowerCase();
+      const isQuestion =
+        lower.includes('what is') ||
+        lower.includes('tell me') ||
+        lower.includes('explain') ||
+        lower.includes('about vinicunca') ||
+        lower.includes('ecosystem') ||
+        lower.includes('afro talent') ||
+        lower.includes('forest') ||
+        lower.includes('cave') ||
+        lower.includes('nest') ||
+        lower.includes('who are you');
+
+      if (isQuestion) {
+        setIsInspecting(true);
+        isInspectingRef.current = true;
+
+        fetch('/api/ask-vinicunca', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question: rawTranscript }),
+        })
+          .then((res) => res.json())
+          .then((data) => {
+            speakInstantFemale(
+              data.answer ||
+                'The Vinicunca is a connected ecosystem where creators, entrepreneurs, and visionaries grow together, build thriving businesses, and create lasting impact.',
+              () => {
+                setIsInspecting(false);
+                isInspectingRef.current = false;
+              }
+            );
+          })
+          .catch(() => {
+            speakInstantFemale(
+              'The Vinicunca is a connected ecosystem where creators, professionals, and visionaries grow together.',
+              () => {
+                setIsInspecting(false);
+                isInspectingRef.current = false;
+              }
+            );
+          });
+        return;
+      }
+
       const cleanName = rawTranscript
         .replace(/my name is/i, '')
         .replace(/i am/i, '')
@@ -365,7 +417,7 @@ export default function App() {
     speakInstantFemale(WELCOME_PHRASE);
   }, [speakInstantFemale]);
 
-  // Robust, single-lifecycle SpeechRecognition engine (eliminates DOMException & invalid state errors)
+  // Speech Recognition listener
   useEffect(() => {
     const SpeechRecognition =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
@@ -386,48 +438,34 @@ export default function App() {
       };
 
       recognition.onresult = (event: any) => {
-        // Ignore recognized speech if AI is currently speaking its own response
         if (isSpeakingRef.current) return;
 
         const lastResultIndex = event.results.length - 1;
         const transcript = (event.results[lastResultIndex][0]?.transcript || '').trim();
         const lower = transcript.toLowerCase();
 
-        // 1. Wake word command: "Hey Vinicunca"
         if (lower.includes('vinicunca') || lower.includes('hey vinicunca')) {
           handleWakeUp();
           return;
         }
 
-        // 2. Name checking when awake
         if (isAwakeRef.current && transcript.length > 1) {
           processGuestName(transcript);
         }
       };
 
-      recognition.onerror = (event: any) => {
+      recognition.onerror = () => {
         isRecognizingRef.current = false;
-        // Suppress expected transient events (not-allowed before click, no-speech timeout, aborted)
-        if (
-          event.error !== 'no-speech' &&
-          event.error !== 'aborted' &&
-          event.error !== 'not-allowed'
-        ) {
-          console.warn('SpeechRecognition warning:', event.error);
-        }
       };
 
       recognition.onend = () => {
         isRecognizingRef.current = false;
-        // Auto-restart safely with delay if still mounted
         if (shouldListenRef.current && !isRecognizingRef.current) {
           setTimeout(() => {
             if (shouldListenRef.current && !isRecognizingRef.current && recognition) {
               try {
                 recognition.start();
-              } catch {
-                // Ignore if browser is not ready
-              }
+              } catch {}
             }
           }, 400);
         }
@@ -435,15 +473,10 @@ export default function App() {
 
       recognitionRef.current = recognition;
 
-      // Attempt start safely
       try {
         recognition.start();
-      } catch {
-        // Browser requires user gesture first, handled on button click
-      }
-    } catch {
-      // Speech recognition not supported or denied
-    }
+      } catch {}
+    } catch {}
 
     return () => {
       shouldListenRef.current = false;
@@ -452,22 +485,17 @@ export default function App() {
           recognition.abort();
         } catch {}
       }
-      if (speechResumeTimerRef.current) {
-        clearInterval(speechResumeTimerRef.current);
-      }
     };
   }, [handleWakeUp, processGuestName]);
 
   // Central Speaker Button handler
   const handleCentralSpeakerClick = () => {
-    // Ensure speech synthesis and audio context are resumed on click
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       if (window.speechSynthesis.paused) {
         window.speechSynthesis.resume();
       }
     }
 
-    // Try starting recognition on user gesture if not already active
     if (recognitionRef.current && !isRecognizingRef.current) {
       try {
         recognitionRef.current.start();
@@ -486,12 +514,9 @@ export default function App() {
     handleWakeUp();
   };
 
-  // Drag-and-drop CSV upload onto window (completely invisible in UI, zero clutter)
+  // Drag-and-drop CSV upload
   useEffect(() => {
-    const handleDragOver = (e: DragEvent) => {
-      e.preventDefault();
-    };
-
+    const handleDragOver = (e: DragEvent) => e.preventDefault();
     const handleDrop = (e: DragEvent) => {
       e.preventDefault();
       const file = e.dataTransfer?.files?.[0];
@@ -521,14 +546,14 @@ export default function App() {
 
   return (
     <div className="relative w-screen h-screen min-h-screen bg-[#ECECE9] text-neutral-900 font-sans antialiased overflow-hidden select-none flex items-center justify-center">
-      {/* Centralized Animated Head with Smooth Continuous Left-to-Right and Right-to-Left Turn */}
+      {/* Centralized Animated Head/Body */}
       <motion.div
         className="absolute inset-0 flex items-center justify-center pointer-events-none overflow-hidden"
         animate={{
-          x: mousePos.x * 12 + (isSpeaking ? Math.sin(Date.now() / 150) * 2 : 0),
-          y: mousePos.y * 8 + (isSpeaking ? Math.cos(Date.now() / 150) * 2.5 : 0),
-          rotateY: mousePos.x * 5,
-          rotateX: -mousePos.y * 5,
+          x: mousePos.x * 12 + (isSpeaking ? Math.sin(Date.now() / 150) * 1.5 : 0),
+          y: mousePos.y * 8 + (isSpeaking ? Math.cos(Date.now() / 150) * 2 : 0),
+          rotateY: isSpeaking ? mousePos.x * 2 : mousePos.x * 5,
+          rotateX: isSpeaking ? 0 : -mousePos.y * 5,
           scale: isInspecting ? 1.25 : 1.05,
         }}
         transition={{
@@ -542,9 +567,10 @@ export default function App() {
           transformStyle: 'preserve-3d',
         }}
       >
-        {/* Seamless Continuous Head Turning Video (1080p FastStart with multi-tier fallbacks) */}
+        {/* Continuous Ping-Pong Head Turning Video centered on avatar face */}
+        {/* Continuous Ping-Pong Head Turning Video (Idle graceful turning) */}
         <video
-          ref={videoRef}
+          ref={idleVideoRef}
           autoPlay
           loop
           muted
@@ -558,10 +584,26 @@ export default function App() {
               target.src = FALLBACK_VIDEO_URL;
             }
           }}
-          className="w-full h-full object-cover object-center"
+          className={`w-full h-full object-cover object-[71.5%_35.5%] transition-opacity duration-300 ${
+            isSpeaking ? 'opacity-0 pointer-events-none' : 'opacity-100'
+          }`}
         >
           <source src={OPTIMIZED_VIDEO_URL} type="video/mp4" />
           <source src={SEAMLESS_VIDEO_URL} type="video/mp4" />
+        </video>
+
+        {/* Dynamic Speaking Video: Avatar faces the user directly & moves its actual mouth and jaw */}
+        <video
+          ref={speakingVideoRef}
+          loop
+          muted
+          playsInline
+          preload="auto"
+          className={`absolute inset-0 w-full h-full object-cover object-[71.5%_35.5%] transition-opacity duration-300 pointer-events-none ${
+            isSpeaking ? 'opacity-100' : 'opacity-0'
+          }`}
+        >
+          <source src={SPEAKING_VIDEO_URL} type="video/mp4" />
         </video>
 
         {/* Ethereal speaking aura */}

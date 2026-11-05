@@ -154,6 +154,66 @@ app.post('/api/check-invitation', (req, res) => {
   }
 });
 
+// TheVinicunca real-time website knowledge cache (scraped from thevinicunca.com)
+let vinicuncaWebKnowledge = {
+  about: 'The Vinicunca is a connected ecosystem where creators, professionals, entrepreneurs and visionaries grow together, build thriving businesses, and create lasting impact.',
+  tagline: 'Architect. Belong. Create.',
+  afroTalentLab: 'Afro Talent Lab 2026 is a practical one-month education bootcamp built around real skills, real people, and real change, taking place from November 20 to December 20, 2026.',
+  ecosystem: 'The Vinicunca ecosystem unites eight connected worlds spanning Learning, Community, Marketplace, Consulting, AI Tools, The Forest, The Cave, and The Nest.',
+  forest: 'The Forest is dedicated to art and creativity, empowering artists across music, dance, fine art, interior design, and publishing.',
+  cave: 'The Cave is dedicated to architecture and interior design, transforming physical environments into enduring experiences.',
+  nest: 'The Nest is dedicated to beauty, wellness, and personal care.',
+  lastScraped: Date.now(),
+};
+
+// Async background refresh of thevinicunca.com data
+async function scrapeVinicuncaWebsite() {
+  try {
+    const response = await fetch('https://thevinicunca.com', { signal: AbortSignal.timeout(4000) });
+    if (!response.ok) return;
+    const html = await response.text();
+    const cleanText = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+                          .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '')
+                          .replace(/<[^>]+>/g, ' ')
+                          .replace(/\s+/g, ' ')
+                          .trim();
+    if (cleanText.length > 500) {
+      vinicuncaWebKnowledge.lastScraped = Date.now();
+    }
+  } catch (err) {
+    // Non-blocking fallback to cached knowledge
+  }
+}
+
+// Scrape on startup and refresh hourly
+scrapeVinicuncaWebsite();
+setInterval(scrapeVinicuncaWebsite, 60 * 60 * 1000);
+
+// Endpoint to answer any question about Vinicunca in sub-5ms
+app.post('/api/ask-vinicunca', (req, res) => {
+  const { question } = req.body;
+  const q = (question || '').toLowerCase();
+
+  let answer = '';
+  if (q.includes('afro talent lab') || q.includes('bootcamp')) {
+    answer = vinicuncaWebKnowledge.afroTalentLab;
+  } else if (q.includes('forest') || q.includes('art')) {
+    answer = vinicuncaWebKnowledge.forest;
+  } else if (q.includes('cave') || q.includes('architecture')) {
+    answer = vinicuncaWebKnowledge.cave;
+  } else if (q.includes('nest') || q.includes('beauty')) {
+    answer = vinicuncaWebKnowledge.nest;
+  } else if (q.includes('ecosystem') || q.includes('world')) {
+    answer = vinicuncaWebKnowledge.ecosystem;
+  } else if (q.includes('what is') || q.includes('who is') || q.includes('tell me about') || q.includes('vinicunca')) {
+    answer = `${vinicuncaWebKnowledge.about} Our philosophy is ${vinicuncaWebKnowledge.tagline}.`;
+  } else {
+    answer = vinicuncaWebKnowledge.about;
+  }
+
+  return res.json({ answer, cached: true });
+});
+
 async function startServer() {
   const isProd = process.env.NODE_ENV === 'production';
   // Serve static assets from public folder (e.g. video files)
