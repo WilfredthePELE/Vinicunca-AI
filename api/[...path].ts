@@ -1,5 +1,7 @@
 import type { Request, Response } from 'express';
-import app, { initializeApp } from '../server';
+// Keep the TypeScript extension so Vercel's bundler includes server.ts in the
+// function bundle instead of leaving Node an unresolved extensionless import.
+import app, { initializeApp } from '../server.ts';
 
 /** Route every /api/* request through the shared Express API. */
 export default async function handler(req: Request, res: Response) {
