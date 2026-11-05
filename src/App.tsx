@@ -43,9 +43,10 @@ export default function App() {
   const isAwakeRef = useRef(false);
   const isSpeakingRef = useRef(false);
   const isInspectingRef = useRef(false);
-  const phaseRef = useRef<'sleeping' | 'asking-name' | 'confirming' | 'checking'>('sleeping');
+  const phaseRef = useRef<'sleeping' | 'asking-name' | 'confirming' | 'checking' | 'thinking'>('sleeping');
   const pendingGuestRef = useRef<GuestRecord | null>(null);
   const ignoredAudioUntilRef = useRef(0);
+  const conversationHistoryRef = useRef<Array<{ role: 'user' | 'model'; text: string }>>([]);
 
   // Recognition and Speech refs
   const recognitionRef = useRef<any>(null);
@@ -359,6 +360,43 @@ export default function App() {
     }
   }, [refreshAttendance, speakInstantFemale]);
 
+  const handleConversationalInput = useCallback(async (text: string) => {
+    phaseRef.current = 'thinking';
+    setStatusText('Thinking of a useful answer');
+    try {
+      const response = await fetch('/api/conversation', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: text, history: conversationHistoryRef.current }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Conversation request failed');
+      conversationHistoryRef.current = [
+        ...conversationHistoryRef.current,
+        { role: 'user', text: text.slice(0, 500) },
+        ...(result.reply ? [{ role: 'model' as const, text: String(result.reply).slice(0, 500) }] : []),
+      ].slice(-8);
+
+      if (result.intent === 'guest_name') {
+        phaseRef.current = 'asking-name';
+        await processGuestName(typeof result.name === 'string' && result.name.trim() ? result.name : text);
+        return;
+      }
+
+      phaseRef.current = 'asking-name';
+      const reply = typeof result.reply === 'string' && result.reply.trim()
+        ? result.reply
+        : 'I can answer questions about Vinicunca or help check your invitation. What would you like to know?';
+      setStatusText(result.intent === 'question' ? 'Answering your question' : 'Ready to help');
+      speakInstantFemale(reply);
+    } catch (error) {
+      console.error('Conversational reply failed:', error);
+      phaseRef.current = 'asking-name';
+      setStatusText('Conversation service unavailable');
+      speakInstantFemale('I have lost my train of thought for a moment. Please try again, or tell me your full name for check-in.');
+    }
+  }, [processGuestName, speakInstantFemale]);
+
   const handleTranscript = useCallback((transcript: string) => {
     const text = transcript.trim();
     if (!text || isSpeakingNowRef.current || Date.now() < ignoredAudioUntilRef.current) return;
@@ -373,7 +411,7 @@ export default function App() {
       phaseRef.current = 'asking-name';
       const afterWake = lower.slice(wake.index + wake[0].length).replace(/^[,\s]+/, '').trim();
       if (afterWake.length > 2 && !/^(please|hello|hi|are you there)$/.test(afterWake)) {
-        void processGuestName(afterWake);
+        void handleConversationalInput(afterWake);
       } else {
         setStatusText('Listening for the attendee name');
         speakInstantFemale(WELCOME_PHRASE);
@@ -382,7 +420,7 @@ export default function App() {
     }
 
     if (phaseRef.current === 'asking-name') {
-      if (phaseRef.current !== 'checking') void processGuestName(text);
+      void handleConversationalInput(text);
       return;
     }
     if (phaseRef.current === 'confirming') {
@@ -397,7 +435,7 @@ export default function App() {
         speakInstantFemale('Please say yes if that is you, or no if it is not.');
       }
     }
-  }, [confirmGuestCheckIn, processGuestName, speakInstantFemale]);
+  }, [confirmGuestCheckIn, handleConversationalInput, speakInstantFemale]);
 
   const startBrowserRecognition = useCallback(() => {
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;

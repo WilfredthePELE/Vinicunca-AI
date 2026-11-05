@@ -8,12 +8,13 @@ After pushing changes, redeploy the latest `main` commit. Add these server-side 
 
 - `ELEVENLABS_API_KEY`
 - `ELEVENLABS_VOICE_ID`
+- `GEMINI_API_KEY`
 - `SUPABASE_URL`
 - `SUPABASE_SECRET_KEY`
 
-Optional: `ELEVENLABS_TTS_MODEL_ID` (defaults to `eleven_flash_v2_5`). Do not use a `VITE_` prefix for secrets. Do not commit `.env` files.
+Optional: `GEMINI_MODEL` (defaults to `gemini-2.5-flash`), `VINICUNCA_SITE_URL` (defaults to `https://thevinicunca.com/`), and `ELEVENLABS_TTS_MODEL_ID` (defaults to `eleven_flash_v2_5`). Do not use a `VITE_` prefix for secrets. Do not commit `.env` files.
 
-The Supabase project must have the tables required by the app (`event_attendees` and `event_checkins`) and allow the server key to access them. On deployment, verify `/api/health` and `/api/voice-config` return JSON rather than a Vercel 404. `realtimeListeningReady` and `elevenLabsVoiceReady` should both be `true` when the corresponding variables are set.
+The assistant reads the public `thevinicunca.com` homepage and up to four same-domain pages on first conversation, then caches that text for 30 minutes. The Gemini API key is used only on the server. The Supabase project must have the tables required by the app (`event_attendees` and `event_checkins`) and allow the server key to access them. On deployment, verify `/api/health` and `/api/voice-config` return JSON rather than a Vercel 404. `realtimeListeningReady`, `elevenLabsVoiceReady`, and `conversationalAIReady` should all be `true` when the corresponding variables are set.
 
 ## Local development
 
