@@ -1,5 +1,4 @@
 import express from 'express';
-import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
 import path from 'path';
 import fs from 'fs';
@@ -107,6 +106,22 @@ const SUPABASE_URL = process.env.SUPABASE_URL?.replace(/\/$/, '');
 // with projects that still use the legacy service_role key.
 const SUPABASE_SERVER_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
 const hasSupabase = Boolean(SUPABASE_URL && SUPABASE_SERVER_KEY);
+let initialization: Promise<void> | undefined;
+
+export async function initializeApp() {
+  if (!initialization) {
+    initialization = (async () => {
+      if (Boolean(SUPABASE_URL) !== Boolean(SUPABASE_SERVER_KEY)) {
+        throw new Error('Set both SUPABASE_URL and SUPABASE_SECRET_KEY, or leave both unset.');
+      }
+      if (hasSupabase) await loadSupabaseData();
+    })().catch((error) => {
+      initialization = undefined;
+      throw error;
+    });
+  }
+  return initialization;
+}
 
 async function supabaseRequest(resource: string, init: RequestInit = {}) {
   if (!SUPABASE_URL || !SUPABASE_SERVER_KEY) throw new Error('Supabase is not configured');
@@ -304,6 +319,10 @@ app.get('/api/check-ins/stats', (_req, res) => {
   res.json({ total: guestList.length, checkedIn: guestList.filter((guest) => checkIns.has(guest.id)).length });
 });
 
+app.get('/api/health', (_req, res) => {
+  res.json({ ok: true, databaseConfigured: hasSupabase });
+});
+
 app.get('/api/voice-config', (_req, res) => {
   const ready = Boolean(process.env.ELEVENLABS_API_KEY);
   res.json({ realtimeListeningReady: ready, elevenLabsVoiceReady: ready && Boolean(process.env.ELEVENLABS_VOICE_ID) });
@@ -366,25 +385,12 @@ app.post('/api/speak', async (req, res) => {
 
 async function startServer() {
   const isProd = process.env.NODE_ENV === 'production';
-  if (Boolean(SUPABASE_URL) !== Boolean(SUPABASE_SERVER_KEY)) {
-    console.error('Set SUPABASE_URL and SUPABASE_SECRET_KEY (or the legacy SUPABASE_SERVICE_ROLE_KEY), or leave both blank to use local storage.');
-    process.exitCode = 1;
-    return;
-  }
-  if (hasSupabase) {
-    try {
-      await loadSupabaseData();
-      console.log(`Loaded ${guestList.length} attendees and ${checkIns.size} check-ins from Supabase.`);
-    } catch (error) {
-      console.error('Supabase could not be loaded. Server startup stopped to protect attendance data.', error);
-      process.exitCode = 1;
-      return;
-    }
-  }
+  await initializeApp();
   const publicPath = path.resolve(process.cwd(), 'public');
   if (fs.existsSync(publicPath)) app.use(express.static(publicPath));
 
   if (!isProd) {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true, hmr: false, ws: false },
       appType: 'spa',
@@ -401,4 +407,13 @@ async function startServer() {
   });
 }
 
-startServer();
+export default app;
+
+// Vercel invokes the Express app through api/[...path].ts. Only start a
+// listening server when running locally or on a conventional Node host.
+if (!process.env.VERCEL) {
+  startServer().catch((error) => {
+    console.error('Vinicunca AI failed to start:', error);
+    process.exitCode = 1;
+  });
+}
