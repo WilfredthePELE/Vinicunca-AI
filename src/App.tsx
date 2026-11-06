@@ -43,10 +43,12 @@ export default function App() {
   const isAwakeRef = useRef(false);
   const isSpeakingRef = useRef(false);
   const isInspectingRef = useRef(false);
-  const phaseRef = useRef<'sleeping' | 'asking-name' | 'confirming' | 'checking' | 'thinking'>('sleeping');
+  const phaseRef = useRef<'sleeping' | 'asking-name' | 'confirming' | 'checking' | 'thinking' | 'admin-code' | 'admin-confirm'>('sleeping');
   const pendingGuestRef = useRef<GuestRecord | null>(null);
   const ignoredAudioUntilRef = useRef(0);
   const conversationHistoryRef = useRef<Array<{ role: 'user' | 'model'; text: string }>>([]);
+  const adminTokenRef = useRef('');
+  const pendingAdminCommandRef = useRef<{ action: string; name?: string; challenge?: string } | null>(null);
 
   // Recognition and Speech refs
   const recognitionRef = useRef<any>(null);
@@ -360,6 +362,111 @@ export default function App() {
     }
   }, [refreshAttendance, speakInstantFemale]);
 
+  const runAdminCommand = useCallback(async (command: { action: string; name?: string; challenge?: string }) => {
+    phaseRef.current = 'thinking';
+    setStatusText('Carrying out admin request');
+    try {
+      const response = await fetch('/api/admin/command', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminTokenRef.current}` },
+        body: JSON.stringify({
+          action: command.action,
+          name: command.name,
+          challenge: command.challenge,
+          confirmation: command.challenge ? 'confirm clear registrations' : undefined,
+        }),
+      });
+      if (response.status === 401) {
+        adminTokenRef.current = '';
+        pendingAdminCommandRef.current = command;
+        phaseRef.current = 'admin-code';
+        setStatusText('Admin code required again');
+        speakInstantFemale('Your admin session has expired. Please say your admin code again.');
+        return;
+      }
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Admin request failed');
+      if (result.confirmationRequired) {
+        pendingAdminCommandRef.current = { action: 'clear', challenge: result.challenge };
+        phaseRef.current = 'admin-confirm';
+        setStatusText('Waiting for clear registrations confirmation');
+        speakInstantFemale(result.prompt || 'Say confirm clear registrations to permanently remove the attendee list.');
+        return;
+      }
+
+      pendingAdminCommandRef.current = null;
+      phaseRef.current = 'asking-name';
+      if (command.action === 'stats') {
+        setGuestCount(result.total ?? 0);
+        setCheckedInCount(result.checkedIn ?? 0);
+        speakInstantFemale(`There are ${result.total} registrations. ${result.checkedIn} have arrived, and ${result.remaining} are still expected.`);
+      } else if (command.action === 'find') {
+        const matches = result.matches || [];
+        if (!matches.length) speakInstantFemale(`I could not find ${command.name} on the registration list.`);
+        else speakInstantFemale(matches.map((guest: any) => `${guest.name} is registered, ${guest.checkedInAt ? 'and has arrived' : 'and has not arrived yet'}${guest.table ? `, at ${guest.table}` : ''}`).join('. '));
+      } else if (command.action === 'add') {
+        setGuestCount(result.total ?? guestCount + 1);
+        speakInstantFemale(`${result.guest.name} has been added to the registrations.`);
+      } else if (command.action === 'clear') {
+        setGuestCount(0);
+        setCheckedInCount(0);
+        speakInstantFemale('The attendee registrations and arrival records have been cleared.');
+      }
+    } catch (error) {
+      console.error('Admin action failed:', error);
+      phaseRef.current = 'asking-name';
+      setStatusText('Admin request could not be completed');
+      speakInstantFemale('I could not complete that admin request. Please check the server and database, then try again.');
+    }
+  }, [guestCount, speakInstantFemale]);
+
+  const unlockAdmin = useCallback(async (code: string) => {
+    try {
+      const response = await fetch('/api/admin/unlock', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.token) throw new Error(result.error || 'Admin code was not accepted');
+      adminTokenRef.current = result.token;
+      setIsAwake(true);
+      isAwakeRef.current = true;
+      const pending = pendingAdminCommandRef.current;
+      if (pending) {
+        void runAdminCommand(pending);
+      } else {
+        phaseRef.current = 'asking-name';
+        setStatusText('Admin access active for 15 minutes');
+        speakInstantFemale('Admin access confirmed. You are in charge now. What would you like me to do?');
+      }
+    } catch (error) {
+      console.error('Admin unlock failed:', error);
+      pendingAdminCommandRef.current = null;
+      phaseRef.current = 'asking-name';
+      setStatusText('Admin code was not accepted');
+      speakInstantFemale('That admin code was not accepted. You can still ask me about Vinicunca or give me your name for check-in.');
+    }
+  }, [runAdminCommand, speakInstantFemale]);
+
+  const requestAdminCommand = useCallback((intent: string, name = '') => {
+    const action = intent === 'admin_stats' ? 'stats'
+      : intent === 'admin_find' ? 'find'
+      : intent === 'admin_add' ? 'add'
+      : intent === 'admin_clear' ? 'clear'
+      : '';
+    if (!action) return;
+    const command = { action, ...(name ? { name } : {}) };
+    if (!adminTokenRef.current) {
+      pendingAdminCommandRef.current = command;
+      phaseRef.current = 'admin-code';
+      setStatusText('Admin code required');
+      speakInstantFemale('I can do that after admin verification. Please say your admin code.');
+      return;
+    }
+    void runAdminCommand(command);
+  }, [runAdminCommand, speakInstantFemale]);
+
   const handleConversationalInput = useCallback(async (text: string) => {
     phaseRef.current = 'thinking';
     setStatusText('Thinking of a useful answer');
@@ -383,6 +490,11 @@ export default function App() {
         return;
       }
 
+      if (String(result.intent).startsWith('admin_')) {
+        requestAdminCommand(result.intent, typeof result.name === 'string' ? result.name : '');
+        return;
+      }
+
       phaseRef.current = 'asking-name';
       const reply = typeof result.reply === 'string' && result.reply.trim()
         ? result.reply
@@ -395,13 +507,35 @@ export default function App() {
       setStatusText('Conversation service unavailable');
       speakInstantFemale('I have lost my train of thought for a moment. Please try again, or tell me your full name for check-in.');
     }
-  }, [processGuestName, speakInstantFemale]);
+  }, [processGuestName, requestAdminCommand, speakInstantFemale]);
 
   const handleTranscript = useCallback((transcript: string) => {
     const text = transcript.trim();
     if (!text || isSpeakingNowRef.current || Date.now() < ignoredAudioUntilRef.current) return;
     setLiveTranscript(text);
     const lower = text.toLowerCase().replace(/[^a-z0-9\s']/g, ' ').replace(/\s+/g, ' ').trim();
+
+    const adminCodePrefix = /^admin\s+code\s+/i;
+    if (adminCodePrefix.test(text)) {
+      void unlockAdmin(text.replace(adminCodePrefix, '').trim());
+      return;
+    }
+    if (phaseRef.current === 'admin-code') {
+      void unlockAdmin(text);
+      return;
+    }
+    if (phaseRef.current === 'admin-confirm') {
+      if (lower.replace(/[^a-z0-9]/g, '') === 'confirmclearregistrations') {
+        const pending = pendingAdminCommandRef.current;
+        if (pending) void runAdminCommand(pending);
+      } else {
+        pendingAdminCommandRef.current = null;
+        phaseRef.current = 'asking-name';
+        setStatusText('Clear registrations cancelled');
+        speakInstantFemale('Okay, I have not cleared anything. Your registrations are safe.');
+      }
+      return;
+    }
 
     if (phaseRef.current === 'sleeping') {
       const wake = /\b(?:hey\s+)?(vini|vinicunca)\b/i.exec(lower);
@@ -411,7 +545,8 @@ export default function App() {
       phaseRef.current = 'asking-name';
       const afterWake = lower.slice(wake.index + wake[0].length).replace(/^[,\s]+/, '').trim();
       if (afterWake.length > 2 && !/^(please|hello|hi|are you there)$/.test(afterWake)) {
-        void handleConversationalInput(afterWake);
+        if (afterWake.startsWith('admin code ')) void unlockAdmin(afterWake.slice('admin code '.length).trim());
+        else void handleConversationalInput(afterWake);
       } else {
         setStatusText('Listening for the attendee name');
         speakInstantFemale(WELCOME_PHRASE);
@@ -435,7 +570,7 @@ export default function App() {
         speakInstantFemale('Please say yes if that is you, or no if it is not.');
       }
     }
-  }, [confirmGuestCheckIn, handleConversationalInput, speakInstantFemale]);
+  }, [confirmGuestCheckIn, handleConversationalInput, runAdminCommand, speakInstantFemale, unlockAdmin]);
 
   const startBrowserRecognition = useCallback(() => {
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
@@ -632,6 +767,11 @@ export default function App() {
   };
 
   const importGuestCsv = useCallback((file: File) => {
+    if (!adminTokenRef.current) {
+      setStatusText('Admin code required to change the attendee list');
+      speakInstantFemale('Admin access is required to change registrations. Say your admin code, then choose the CSV file again.');
+      return;
+    }
     if (!file.name.toLowerCase().endsWith('.csv') && !file.type.includes('csv')) {
       setStatusText('Please choose a CSV file for the guest list.');
       return;
@@ -643,7 +783,7 @@ export default function App() {
       try {
         const response = await fetch('/api/invitations', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminTokenRef.current}` },
           body: JSON.stringify({ csvContent: content }),
         });
         const result = await response.json();

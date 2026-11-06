@@ -11,10 +11,15 @@ After pushing changes, redeploy the latest `main` commit. Add these server-side 
 - `GEMINI_API_KEY`
 - `SUPABASE_URL`
 - `SUPABASE_SECRET_KEY`
+- `ADMIN_PIN` (set this to the private spoken code you choose; do not commit it)
 
-Optional: `GEMINI_MODEL` (defaults to `gemini-2.5-flash`), `VINICUNCA_SITE_URL` (defaults to `https://thevinicunca.com/`), and `ELEVENLABS_TTS_MODEL_ID` (defaults to `eleven_flash_v2_5`). Do not use a `VITE_` prefix for secrets. Do not commit `.env` files.
+Optional: `ADMIN_SESSION_SECRET` (use a long random secret for signing short admin sessions; if absent, the admin code signs sessions), `GEMINI_MODEL` (defaults to `gemini-2.5-flash`), `VINICUNCA_SITE_URL` (defaults to `https://thevinicunca.com/`), and `ELEVENLABS_TTS_MODEL_ID` (defaults to `eleven_flash_v2_5`). Do not use a `VITE_` prefix for secrets. Do not commit `.env` files.
 
 The assistant reads the public `thevinicunca.com` homepage and up to four same-domain pages on first conversation, then caches that text for 30 minutes. The Gemini API key is used only on the server. The Supabase project must have the tables required by the app (`event_attendees` and `event_checkins`) and allow the server key to access them. On deployment, verify `/api/health` and `/api/voice-config` return JSON rather than a Vercel 404. `realtimeListeningReady`, `elevenLabsVoiceReady`, and `conversationalAIReady` should all be `true` when the corresponding variables are set.
+
+## Voice admin controls
+
+Say “Admin code” followed by the private value configured in `ADMIN_PIN`. Admin access expires after 15 minutes. After unlock, ask for arrival totals, search for a named attendee, or say “add registration for [full name]”. To remove everyone, ask to clear registrations and then say “confirm clear registrations” when prompted. CSV replacement also requires an active admin session. Do not use the example phrase from chat as a production secret; choose a private code in Vercel.
 
 ## Local development
 
