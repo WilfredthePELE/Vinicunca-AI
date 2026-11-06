@@ -67,8 +67,9 @@ function parseCSV(csvString: string): Guest[] {
 
   const headers = rows[0].map((value) => value.toLowerCase());
   const nameIndex = headers.indexOf('name') >= 0 ? headers.indexOf('name') : 0;
+  const idIndex = headers.indexOf('id');
   const tierIndex = headers.indexOf('tier');
-  const tableIndex = headers.indexOf('table');
+  const tableIndex = headers.indexOf('table') >= 0 ? headers.indexOf('table') : headers.indexOf('table_name');
 
   const occurrences = new Map<string, number>();
   return rows.slice(1).flatMap((values) => {
@@ -82,7 +83,7 @@ function parseCSV(csvString: string): Guest[] {
     const occurrence = (occurrences.get(slug) || 0) + 1;
     occurrences.set(slug, occurrence);
     return [{
-      id: `guest-${slug}-${occurrence}`,
+      id: (idIndex >= 0 ? values[idIndex] : '')?.trim() || `guest-${slug}-${occurrence}`,
       name,
       tier: (tierIndex >= 0 ? values[tierIndex] : '')?.trim() || 'Invited Guest',
       table: (tableIndex >= 0 ? values[tableIndex] : '')?.trim() || 'Main Pavilion',
