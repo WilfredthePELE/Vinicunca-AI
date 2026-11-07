@@ -477,7 +477,11 @@ export default function App() {
         body: JSON.stringify({ message: text, history: conversationHistoryRef.current }),
       });
       const result = await response.json();
-      if (!response.ok) throw new Error(result.error || 'Conversation request failed');
+      if (!response.ok) {
+        const error = new Error(result.error || 'Conversation request failed') as Error & { code?: string };
+        error.code = typeof result.code === 'string' ? result.code : undefined;
+        throw error;
+      }
       conversationHistoryRef.current = [
         ...conversationHistoryRef.current,
         { role: 'user', text: text.slice(0, 500) },
@@ -504,8 +508,20 @@ export default function App() {
     } catch (error) {
       console.error('Conversational reply failed:', error);
       phaseRef.current = 'asking-name';
-      setStatusText('Conversation service unavailable');
-      speakInstantFemale('I have lost my train of thought for a moment. Please try again, or tell me your full name for check-in.');
+      const code = error instanceof Error && 'code' in error ? String(error.code || '') : '';
+      const feedback: Record<string, { status: string; speech: string }> = {
+        GEMINI_KEY_MISSING: { status: 'Gemini API key is missing in Vercel', speech: 'My conversation service is not configured right now. You can still tell me your full name for check-in.' },
+        GEMINI_AUTH_ERROR: { status: 'Gemini rejected the API key', speech: 'I cannot reach my conversation service right now. You can still tell me your full name for check-in.' },
+        GEMINI_MODEL_UNAVAILABLE: { status: 'Gemini model is unavailable', speech: 'My conversation model is unavailable right now. You can still tell me your full name for check-in.' },
+        GEMINI_QUOTA_OR_RATE_LIMIT: { status: 'Gemini quota or rate limit reached', speech: 'My conversation service has reached a usage limit. You can still tell me your full name for check-in.' },
+        GEMINI_TIMEOUT: { status: 'Gemini response timed out', speech: 'That answer is taking too long. Please try once more, or tell me your full name for check-in.' },
+        GEMINI_EMPTY_RESPONSE: { status: 'Gemini returned no answer', speech: 'I did not get an answer back. Please try once more, or tell me your full name for check-in.' },
+        GEMINI_PROVIDER_ERROR: { status: 'Gemini request failed; check Vercel logs', speech: 'My conversation service had a problem. You can still tell me your full name for check-in.' },
+        GEMINI_REQUEST_FAILED: { status: 'Could not reach Gemini; check Vercel logs', speech: 'My conversation service is temporarily unreachable. You can still tell me your full name for check-in.' },
+      };
+      const message = feedback[code] || { status: 'Conversation request failed; check Vercel logs', speech: 'I could not get a reply just now. Please try again, or tell me your full name for check-in.' };
+      setStatusText(message.status);
+      speakInstantFemale(message.speech);
     }
   }, [processGuestName, requestAdminCommand, speakInstantFemale]);
 
